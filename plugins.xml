@@ -1,5 +1,5 @@
 <plugins>
-    <pyqgis_plugin name="Path Filter Tool" version="1.8">
+    <pyqgis_plugin name="Path Filter Tool" version="1.9">
         <description>เครื่องมือกรองข้อมูล</description>
         <download_url>https://github.com/PARKPHUM/Filter_PATH/blob/main/Filter_PATH.zip</download_url>
     </pyqgis_plugin>
