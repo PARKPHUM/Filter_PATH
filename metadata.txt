@@ -1,0 +1,10 @@
+[general]
+name=Path Filter & BND Editor
+description=Filter PATH , Edit Attribute UTM and BND_NAME with Map Tool
+about=เครื่องมือกรองข้อมูล แก้ไข Attribute และชื่อหมุดหลักเขต กรมที่ดิน
+version=2.6
+qgisMinimumVersion=3.0
+author=PARKPHUM S.
+email=poonza2538@gmail.com
+category=Vector
+icon=icon.png
