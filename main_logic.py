@@ -238,12 +238,10 @@ class FeatureSelectTool(QgsMapToolEmitPoint):
 
         if not found_features:
             self.parent_dialog.iface.messageBar().pushMessage("แจ้งเตือน", "ไม่พบรายการที่ตรงกับในตาราง Filter", level=1)
-            self.canvas.unsetMapTool(self)
             return
 
         if len(found_features) == 1:
             self.parent_dialog.toggle_table_row(found_features[0]["id"], found_features[0]["type"])
-            self.canvas.unsetMapTool(self)
         else:
             # Overlap case - popup menu
             menu = QMenu()
@@ -252,7 +250,6 @@ class FeatureSelectTool(QgsMapToolEmitPoint):
                 action.triggered.connect(lambda checked, i=item: self.parent_dialog.toggle_table_row(i["id"], i["type"]))
                 menu.addAction(action)
             menu.exec_(QCursor.pos())
-            self.canvas.unsetMapTool(self)
 
 # --- 3. เครื่องมือเมาส์สำหรับคลิกเลือกหมุดบนแผนที่ (อันเก่า สำหรับ BND_NAME) ---
 class PointSelectTool(QgsMapToolEmitPoint):
@@ -332,6 +329,7 @@ class PathFilterTool(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.itemChanged.connect(self.update_map_selection)
         layout.addWidget(QLabel("รายการที่ค้นพบ (ติ๊กหน้ารายการที่ต้องการแก้ไข):"))
         layout.addWidget(self.table)
         
@@ -411,16 +409,23 @@ class PathFilterTool(QDialog):
             self.table.setRowCount(0)
 
     def populate_table(self):
+        self.table.blockSignals(True)
         self.table.setRowCount(0)
         p_layer = self.point_combo.currentLayer()
         poly_layer = self.poly_combo.currentLayer()
         
         row_idx = 0
         if poly_layer and poly_layer.subsetString():
-            idx = poly_layer.fields().indexOf("LANDNO")
-            if idx == -1: idx = poly_layer.fields().indexOf("LAND_NO")
+            idx_landno = poly_layer.fields().indexOf("LANDNO")
+            if idx_landno == -1: idx_landno = poly_layer.fields().indexOf("LAND_NO")
+            idx_parcel = poly_layer.fields().indexOf("PARCELNO")
+            idx_survey = poly_layer.fields().indexOf("SURVEYNO")
+            
             for f in poly_layer.getFeatures():
-                landno = f.attribute(idx) if idx != -1 else str(f.id())
+                landno = f.attribute(idx_landno) if idx_landno != -1 else str(f.id())
+                parcelno = f.attribute(idx_parcel) if idx_parcel != -1 else "-"
+                surveyno = f.attribute(idx_survey) if idx_survey != -1 else "-"
+                
                 self.table.insertRow(row_idx)
                 
                 chk = QTableWidgetItem("")
@@ -432,16 +437,22 @@ class PathFilterTool(QDialog):
                 type_item = QTableWidgetItem("Polygon")
                 self.table.setItem(row_idx, 1, type_item)
                 
-                desc_item = QTableWidgetItem(f"LANDNO: {landno}")
+                desc_item = QTableWidgetItem(f"{landno} - {parcelno} - {surveyno}")
                 desc_item.setData(Qt.UserRole, str(landno))
                 self.table.setItem(row_idx, 2, desc_item)
                 row_idx += 1
                 
         if p_layer and p_layer.subsetString():
-            idx = p_layer.fields().indexOf("LANDNO")
-            if idx == -1: idx = p_layer.fields().indexOf("LAND_NO")
+            idx_landno = p_layer.fields().indexOf("LANDNO")
+            if idx_landno == -1: idx_landno = p_layer.fields().indexOf("LAND_NO")
+            idx_parcel = p_layer.fields().indexOf("PARCELNO")
+            idx_survey = p_layer.fields().indexOf("SURVEYNO")
+            
             for f in p_layer.getFeatures():
-                landno = f.attribute(idx) if idx != -1 else str(f.id())
+                landno = f.attribute(idx_landno) if idx_landno != -1 else str(f.id())
+                parcelno = f.attribute(idx_parcel) if idx_parcel != -1 else "-"
+                surveyno = f.attribute(idx_survey) if idx_survey != -1 else "-"
+                
                 self.table.insertRow(row_idx)
                 
                 chk = QTableWidgetItem("")
@@ -453,10 +464,33 @@ class PathFilterTool(QDialog):
                 type_item = QTableWidgetItem("Point")
                 self.table.setItem(row_idx, 1, type_item)
                 
-                desc_item = QTableWidgetItem(f"ID: {f.id()} [LANDNO: {landno}]")
+                desc_item = QTableWidgetItem(f"ID:{f.id()}, {landno} - {parcelno} - {surveyno}")
                 desc_item.setData(Qt.UserRole, str(landno))
                 self.table.setItem(row_idx, 2, desc_item)
                 row_idx += 1
+                
+        self.table.blockSignals(False)
+
+    def update_map_selection(self, item=None):
+        p_layer = self.point_combo.currentLayer()
+        poly_layer = self.poly_combo.currentLayer()
+        
+        selected_points = []
+        selected_polys = []
+        
+        for i in range(self.table.rowCount()):
+            if self.table.item(i, 0).checkState() == Qt.Checked:
+                f_type = self.table.item(i, 1).text()
+                f_id = self.table.item(i, 0).data(Qt.UserRole)
+                if f_type == "Point":
+                    selected_points.append(f_id)
+                elif f_type == "Polygon":
+                    selected_polys.append(f_id)
+                    
+        if p_layer:
+            p_layer.selectByIds(selected_points)
+        if poly_layer:
+            poly_layer.selectByIds(selected_polys)
 
     def find_row_by_id_and_type(self, f_id, f_type):
         for i in range(self.table.rowCount()):
@@ -542,6 +576,7 @@ class PathFilterTool(QDialog):
             if l:
                 l.setSubsetString("")
                 l.updateExtents()
+                l.removeSelection()
         self.table.setRowCount(0)
 
     def update_plugin(self):
@@ -550,7 +585,7 @@ class PathFilterTool(QDialog):
             return
 
         reply = QMessageBox.question(self, "ยืนยันอัปเดต", 
-            "ระบบจะทำการดาวน์โหลดเวอร์ชันล่าสุดจาก GitHub ทันที\nคุณต้องการอัปเดตใช่หรือไม่?",
+            "อัปเดตเป็นเวอร์ชันล่าสุดเลยหรือไม่?",
             QMessageBox.Yes | QMessageBox.No)
             
         if reply == QMessageBox.No: return
