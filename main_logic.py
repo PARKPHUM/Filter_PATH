@@ -46,6 +46,22 @@ def parse_version(text):
         return None
 
 
+def format_area_value(v):
+    """จัดรูปตัวเลขเนื้อที่: ตัด .0 ท้ายจำนวนเต็ม, ค่าว่าง/NULL แสดงเป็น -"""
+    if v is None:
+        return "-"
+    s = str(v).strip()
+    if s in ("", "NULL"):
+        return "-"
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+    except ValueError:
+        pass
+    return s
+
+
 # --- 1. หน้าต่างสำหรับการกรอกชื่อหมุดหลักเขตใหม่ (POINT) ---
 class EditBndNameDialog(QDialog):
     def __init__(self, layer, features, parent=None):
@@ -561,7 +577,7 @@ class PathFilterTool(QDialog):
         self.parcel_tool = None
         self.highlight_rb = None
         self.results_dlg = None
-        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.2")
+        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.3")
         self.setMinimumWidth(420)
 
         self.setStyleSheet("""
@@ -730,7 +746,16 @@ class PathFilterTool(QDialog):
         landno = feature.attribute(idx_landno) if idx_landno != -1 else "-"
         parcel = feature.attribute(idx_parcel) if idx_parcel != -1 else "-"
         survey = feature.attribute(idx_survey) if idx_survey != -1 else "-"
-        return f"LANDNO: {landno} | PARCELNO: {parcel} | SURVEYNO: {survey} | ID: {feature.id()}"
+
+        # เนื้อที่ ไร่-งาน-ตารางวา จากคอลัมน์ RAI, NGAN, WA
+        area_parts = []
+        for name in ("RAI", "NGAN", "WA"):
+            idx = poly_layer.fields().indexOf(name)
+            area_parts.append(format_area_value(feature.attribute(idx)) if idx != -1 else "-")
+        area = "-".join(area_parts)
+
+        return (f"LANDNO: {landno} | PARCELNO: {parcel} | SURVEYNO: {survey} | "
+                f"AREA: {area} | ID: {feature.id()}")
 
     def clear_highlight(self):
         if self.highlight_rb:
