@@ -7,16 +7,27 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QIcon, QCursor, QColor
 from qgis.PyQt.QtWidgets import (QAction, QDialog, QVBoxLayout, QLabel,
                                  QLineEdit, QPushButton, QMessageBox, QFormLayout, QGroupBox,
-                                 QMenu, QHBoxLayout)
-from qgis.gui import QgsMapLayerComboBox, QgsMapToolEmitPoint, QgsRubberBand
+                                 QMenu, QHBoxLayout, QListWidget, QListWidgetItem)
+from qgis.gui import (QgsMapLayerComboBox, QgsMapToolEmitPoint, QgsRubberBand,
+                      QgsVertexMarker)
 from qgis.core import (QgsMapLayerProxyModel, QgsRectangle, QgsFeatureRequest,
-                       QgsGeometry, QgsCoordinateTransform, QgsProject, QgsWkbTypes)
+                       QgsGeometry, QgsCoordinateTransform, QgsProject, QgsWkbTypes,
+                       QgsPointXY)
 
 # =====================================================================
 # ตั้งค่าลิงก์ GitHub Repository ของคุณที่นี่ (ต้องเป็นลิงก์ดาวน์โหลดแบบ .zip)
 # เช่น "https://github.com/my-name/my-plugin/archive/refs/heads/main.zip"
 # =====================================================================
 GITHUB_UPDATE_URL = "https://github.com/PARKPHUM/Filter_PATH/archive/refs/heads/main.zip"
+
+# ลิงก์ไฟล์ metadata.txt บน GitHub (ใช้ตรวจสอบเลขเวอร์ชันล่าสุดก่อนอัปเดต)
+GITHUB_METADATA_URL = "https://raw.githubusercontent.com/PARKPHUM/Filter_PATH/main/metadata.txt"
+
+# =====================================================================
+# ผู้พัฒนาปลั๊กอิน: นายภาคภูมิ สูบกำปัง
+# ตำแหน่ง: วิศวกรรังวัดปฏิบัติการ กองเทคโนโลยีทำแผนที่ กรมที่ดิน
+# =====================================================================
+PLUGIN_AUTHOR = "นายภาคภูมิ สูบกำปัง (วิศวกรรังวัดปฏิบัติการ กองเทคโนโลยีทำแผนที่)"
 
 # ชื่อคอลัมน์ที่ใช้เชื่อมโยงระหว่างแปลง (Polygon) กับหมุด (Point)
 JOIN_FIELD = "JOIN"
@@ -25,6 +36,14 @@ JOIN_FIELD = "JOIN"
 def escape_sql(value):
     """กัน single quote ในค่าที่ผู้ใช้กรอก ไม่ให้ expression พัง"""
     return str(value).replace("'", "''")
+
+
+def parse_version(text):
+    """แปลงข้อความเวอร์ชัน เช่น '3.0' ให้เป็น tuple (3, 0) เพื่อใช้เปรียบเทียบ"""
+    try:
+        return tuple(int(x) for x in str(text).strip().split("."))
+    except (ValueError, AttributeError):
+        return None
 
 
 # --- 1. หน้าต่างสำหรับการกรอกชื่อหมุดหลักเขตใหม่ (POINT) ---
@@ -86,7 +105,7 @@ class EditBndNameDialog(QDialog):
 # --- 2. หน้าต่างสำหรับแก้ไข Attribute (แปลงที่คลิกเลือก + หมุดที่ JOIN ตรงกัน) ---
 class EditAttributesDialog(QDialog):
     def __init__(self, point_layer, poly_layer, selected_point_ids, selected_poly_ids,
-                 parent=None, join_val=None):
+                 parent=None):
         super(EditAttributesDialog, self).__init__(parent)
         self.setWindowTitle("แก้ไข Attribute และคำนวณ PATH ใหม่")
         self.setMinimumWidth(400)
@@ -109,8 +128,6 @@ class EditAttributesDialog(QDialog):
 
         # สรุปว่ากำลังจะแก้ไขอะไรบ้าง
         info_text = f"จะแก้ไข: แปลง {len(selected_poly_ids)} แปลง | หมุด {len(selected_point_ids)} จุด"
-        if join_val:
-            info_text += f"\n(เชื่อมโยงด้วย {JOIN_FIELD} = {join_val})"
         info_label = QLabel(info_text)
         info_label.setStyleSheet("color: #c0392b; font-size: 10pt;")
         main_layout.addWidget(info_label)
@@ -242,11 +259,13 @@ class ParcelClickTool(QgsMapToolEmitPoint):
         self.parent_dialog = parent_dialog
         self.setCursor(Qt.CrossCursor)
         self.hover_rb = None
+        self.hover_fid = None
 
     def clear_hover(self):
         if self.hover_rb:
             self.canvas.scene().removeItem(self.hover_rb)
             self.hover_rb = None
+        self.hover_fid = None
 
     def show_hover(self, geom, layer):
         self.clear_hover()
@@ -256,6 +275,41 @@ class ParcelClickTool(QgsMapToolEmitPoint):
         rb.setStrokeColor(QColor(255, 140, 0))
         rb.setWidth(3)
         self.hover_rb = rb
+
+    def canvasMoveEvent(self, e):
+        """ชี้เมาส์โดนแปลงไหน ให้ไฮไลท์แปลงนั้นทันที"""
+        poly_layer = self.parent_dialog.poly_combo.currentLayer()
+        if not poly_layer:
+            self.clear_hover()
+            return
+
+        map_point = self.toMapCoordinates(e.pos())
+        tol = self.canvas.mapUnitsPerPixel() * 2
+        rect = QgsRectangle(map_point.x() - tol, map_point.y() - tol,
+                            map_point.x() + tol, map_point.y() + tol)
+        try:
+            transform = QgsCoordinateTransform(
+                self.canvas.mapSettings().destinationCrs(), poly_layer.crs(), QgsProject.instance())
+            layer_rect = transform.transformBoundingBox(rect)
+            layer_point = transform.transform(map_point)
+        except Exception:
+            layer_rect = rect
+            layer_point = map_point
+
+        pt_geom = QgsGeometry.fromPointXY(QgsPointXY(layer_point))
+        request = QgsFeatureRequest().setFilterRect(layer_rect).setSubsetOfAttributes([])
+
+        found = None
+        for f in poly_layer.getFeatures(request):
+            if f.geometry() and f.geometry().intersects(pt_geom):
+                found = f
+                break
+
+        if found is None:
+            self.clear_hover()
+        elif found.id() != self.hover_fid:
+            self.show_hover(found.geometry(), poly_layer)
+            self.hover_fid = found.id()
 
     def canvasReleaseEvent(self, e):
         if e.button() == Qt.RightButton:
@@ -336,21 +390,170 @@ class PointSelectTool(QgsMapToolEmitPoint):
         self.layer = layer
         self.parent_dialog = parent_dialog
         self.setCursor(Qt.CrossCursor)
+        self.snap_marker = None
+
+    def clear_snap_marker(self):
+        if self.snap_marker:
+            self.canvas.scene().removeItem(self.snap_marker)
+            self.snap_marker = None
+
+    def _rect_around_cursor(self, e):
+        """คืนค่า (สี่เหลี่ยมค้นหาใน CRS ของ Layer, จุด cursor ใน CRS ของ Layer)"""
+        map_point = self.toMapCoordinates(e.pos())
+        tol = self.canvas.mapUnitsPerPixel() * 10
+        rect = QgsRectangle(map_point.x() - tol, map_point.y() - tol,
+                            map_point.x() + tol, map_point.y() + tol)
+        try:
+            transform = QgsCoordinateTransform(
+                self.canvas.mapSettings().destinationCrs(), self.layer.crs(), QgsProject.instance())
+            return transform.transformBoundingBox(rect), transform.transform(map_point)
+        except Exception:
+            return rect, map_point
+
+    def canvasMoveEvent(self, e):
+        """แสดงสัญลักษณ์ Snapping เมื่อเมาส์เข้าใกล้หมุด"""
+        layer_rect, cursor_pt = self._rect_around_cursor(e)
+        request = QgsFeatureRequest().setFilterRect(layer_rect).setSubsetOfAttributes([])
+
+        nearest_pt = None
+        nearest_d = None
+        for f in self.layer.getFeatures(request):
+            g = f.geometry()
+            if not g:
+                continue
+            try:
+                p = g.asPoint()
+            except Exception:
+                p = g.centroid().asPoint()
+            d = (p.x() - cursor_pt.x()) ** 2 + (p.y() - cursor_pt.y()) ** 2
+            if nearest_d is None or d < nearest_d:
+                nearest_d = d
+                nearest_pt = p
+
+        if nearest_pt is None:
+            self.clear_snap_marker()
+            return
+
+        # แปลงตำแหน่งหมุดกลับเป็น CRS ของแผนที่ เพื่อวาด marker
+        try:
+            to_map = QgsCoordinateTransform(
+                self.layer.crs(), self.canvas.mapSettings().destinationCrs(), QgsProject.instance())
+            marker_pt = to_map.transform(nearest_pt)
+        except Exception:
+            marker_pt = nearest_pt
+
+        if not self.snap_marker:
+            m = QgsVertexMarker(self.canvas)
+            m.setColor(QColor(255, 0, 255))
+            m.setIconType(QgsVertexMarker.ICON_BOX)
+            m.setIconSize(14)
+            m.setPenWidth(3)
+            self.snap_marker = m
+        self.snap_marker.setCenter(QgsPointXY(marker_pt))
 
     def canvasReleaseEvent(self, e):
-        point = self.toMapCoordinates(e.pos())
-        tol = self.canvas.mapUnitsPerPixel() * 10
-        rect = QgsRectangle(point.x() - tol, point.y() - tol, point.x() + tol, point.y() + tol)
-
-        request = QgsFeatureRequest().setFilterRect(rect)
+        layer_rect, _ = self._rect_around_cursor(e)
+        request = QgsFeatureRequest().setFilterRect(layer_rect)
         features = [f for f in self.layer.getFeatures(request)]
 
+        self.clear_snap_marker()
         if features:
             dlg = EditBndNameDialog(self.layer, features, self.parent_dialog)
             dlg.exec_()
         else:
             self.parent_dialog.iface.messageBar().pushMessage("แจ้งเตือน", "ไม่พบหมุดบริเวณที่คลิก", level=1)
         self.canvas.unsetMapTool(self)
+
+    def deactivate(self):
+        self.clear_snap_marker()
+        super(PointSelectTool, self).deactivate()
+
+
+# --- 4.5 หน้าต่างแสดงผลการค้นหา (คลิกรายการเพื่อซูมไปที่รายการนั้น) ---
+class FilterResultsDialog(QDialog):
+    MAX_ITEMS = 300
+
+    def __init__(self, iface, results, full_extent, parent=None):
+        super(FilterResultsDialog, self).__init__(parent)
+        self.iface = iface
+        self.full_extent = QgsRectangle(full_extent)
+        self.setWindowTitle("ผลการค้นหา")
+        self.setMinimumSize(400, 320)
+
+        self.setStyleSheet("""
+            QLabel { font-size: 10pt; font-weight: bold; }
+            QListWidget { font-size: 10pt; background-color: white; }
+            QPushButton { font-size: 10pt; font-weight: bold; padding: 6px; border-radius: 4px; }
+        """)
+
+        n_poly = sum(1 for r in results if r[0] == "Polygon")
+        n_point = len(results) - n_poly
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel(
+            f"พบทั้งหมด {len(results)} รายการ (แปลง {n_poly} | หมุด {n_point})\n"
+            "คลิกรายการเพื่อซูมไปที่ตำแหน่งนั้น"))
+
+        self.list_widget = QListWidget()
+        for typ, layer, fid, desc in results[:self.MAX_ITEMS]:
+            prefix = "[แปลง] " if typ == "Polygon" else "[หมุด] "
+            item = QListWidgetItem(prefix + desc)
+            item.setData(Qt.UserRole, (layer, fid))
+            self.list_widget.addItem(item)
+        if len(results) > self.MAX_ITEMS:
+            note = QListWidgetItem(
+                f"... และอีก {len(results) - self.MAX_ITEMS} รายการ (แสดงเฉพาะ {self.MAX_ITEMS} รายการแรก)")
+            note.setFlags(Qt.NoItemFlags)
+            self.list_widget.addItem(note)
+        self.list_widget.itemClicked.connect(self.zoom_to_item)
+        layout.addWidget(self.list_widget)
+
+        row = QHBoxLayout()
+        btn_zoom_all = QPushButton("ซูมดูทั้งหมด")
+        btn_zoom_all.setStyleSheet("background-color: #007bff; color: white;")
+        btn_zoom_all.clicked.connect(self.zoom_all)
+        row.addWidget(btn_zoom_all)
+
+        btn_close = QPushButton("ปิด")
+        btn_close.setStyleSheet("background-color: #6c757d; color: white;")
+        btn_close.clicked.connect(self.close)
+        row.addWidget(btn_close)
+        layout.addLayout(row)
+
+        self.setLayout(layout)
+
+    def zoom_to_item(self, item):
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+        layer, fid = data
+        try:
+            f = layer.getFeature(fid)
+            if not f.isValid() or not f.geometry():
+                return
+            canvas = self.iface.mapCanvas()
+            bbox = f.geometry().boundingBox()
+            try:
+                transform = QgsCoordinateTransform(
+                    layer.crs(), canvas.mapSettings().destinationCrs(), QgsProject.instance())
+                bbox = transform.transformBoundingBox(bbox)
+            except Exception:
+                pass
+            if bbox.width() == 0 and bbox.height() == 0:
+                bbox.grow(25)   # จุดเดี่ยว: ซูมเข้าไปรอบๆ รัศมี 25 หน่วยแผนที่
+            else:
+                bbox.scale(1.5)
+            canvas.setExtent(bbox)
+            canvas.refresh()
+            # กระพริบ Feature บนแผนที่ให้เห็นชัดๆ ว่าอยู่ตรงไหน
+            canvas.flashFeatureIds(layer, [fid])
+        except Exception:
+            pass
+
+    def zoom_all(self):
+        canvas = self.iface.mapCanvas()
+        canvas.setExtent(QgsRectangle(self.full_extent))
+        canvas.refresh()
 
 
 # --- 5. หน้าต่างเครื่องมือหลัก ---
@@ -361,7 +564,8 @@ class PathFilterTool(QDialog):
         self.edit_tool = None
         self.parcel_tool = None
         self.highlight_rb = None
-        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 2.9")
+        self.results_dlg = None
+        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.1")
         self.setMinimumWidth(420)
 
         self.setStyleSheet("""
@@ -418,7 +622,7 @@ class PathFilterTool(QDialog):
         self.btn_edit_attr.clicked.connect(self.activate_parcel_edit_tool)
         layout.addWidget(self.btn_edit_attr)
 
-        hint = QLabel(f"* คลิกซ้ายที่แปลง = แก้ไขแปลง + หมุดที่ {JOIN_FIELD} ตรงกัน | คลิกขวา = ยกเลิก")
+        hint = QLabel("* คลิกซ้ายที่แปลง = แก้ไขแปลง | คลิกขวา = ยกเลิก")
         hint.setStyleSheet("font-size: 9pt; font-weight: normal; color: #666;")
         layout.addWidget(hint)
 
@@ -451,8 +655,9 @@ class PathFilterTool(QDialog):
         combined_extent = QgsRectangle()
         combined_extent.setMinimal()
         has_data = False
+        results = []
 
-        for layer in [p_layer, poly_layer]:
+        for layer, typ in [(poly_layer, "Polygon"), (p_layer, "Point")]:
             if layer:
                 filters = []
                 if path_val:
@@ -464,16 +669,33 @@ class PathFilterTool(QDialog):
                 layer.setSubsetString(subset_str)
                 layer.updateExtents()
 
-                has_features = next(layer.getFeatures(QgsFeatureRequest().setLimit(1)), None) is not None
-                if has_features and not layer.extent().isEmpty():
+                count_before = len(results)
+                for f in layer.getFeatures():
+                    if typ == "Polygon":
+                        desc = self.describe_polygon(layer, f)
+                    else:
+                        desc = self.describe_point(layer, f)
+                    results.append((typ, layer, f.id(), desc))
+
+                if len(results) > count_before and not layer.extent().isEmpty():
                     combined_extent.combineExtentWith(layer.extent())
                     has_data = True
+
+        # ปิดหน้าต่างผลการค้นหาอันเก่า (ถ้ามี)
+        if self.results_dlg:
+            self.results_dlg.close()
+            self.results_dlg = None
 
         if has_data:
             canvas = self.iface.mapCanvas()
             combined_extent.scale(1.1)
             canvas.setExtent(combined_extent)
             canvas.refresh()
+
+            # ถ้าพบมากกว่า 1 รายการ เปิดหน้าต่างรายการให้เลือกซูมไปทีละรายการได้
+            if len(results) > 1:
+                self.results_dlg = FilterResultsDialog(self.iface, results, combined_extent, self)
+                self.results_dlg.show()
         else:
             self.iface.messageBar().pushMessage("แจ้งเตือน", "ไม่พบข้อมูลที่ตรงกับเงื่อนไขที่ค้นหา", level=1)
 
@@ -485,6 +707,9 @@ class PathFilterTool(QDialog):
                 l.updateExtents()
                 l.removeSelection()
         self.clear_highlight()
+        if self.results_dlg:
+            self.results_dlg.close()
+            self.results_dlg = None
 
     # ---------- แก้ไข Attribute แบบคลิกแปลง ----------
     def activate_parcel_edit_tool(self):
@@ -510,6 +735,16 @@ class PathFilterTool(QDialog):
         join_v = feature.attribute(idx_join) if idx_join != -1 else "-"
         parcel = feature.attribute(idx_parcel) if idx_parcel != -1 else "-"
         return f"LANDNO: {landno} | PARCELNO: {parcel} | {JOIN_FIELD}: {join_v} | ID: {feature.id()}"
+
+    def describe_point(self, p_layer, feature):
+        """สร้างข้อความอธิบายหมุดสำหรับแสดงในรายการผลการค้นหา"""
+        idx_landno = p_layer.fields().indexOf("LANDNO")
+        if idx_landno == -1: idx_landno = p_layer.fields().indexOf("LAND_NO")
+        idx_join = p_layer.fields().indexOf(JOIN_FIELD)
+
+        landno = feature.attribute(idx_landno) if idx_landno != -1 else "-"
+        join_v = feature.attribute(idx_join) if idx_join != -1 else "-"
+        return f"ID: {feature.id()} | LANDNO: {landno} | {JOIN_FIELD}: {join_v}"
 
     def clear_highlight(self):
         if self.highlight_rb:
@@ -565,8 +800,7 @@ class PathFilterTool(QDialog):
         if p_layer:
             p_layer.selectByIds(point_ids)
 
-        dlg = EditAttributesDialog(p_layer, poly_layer, point_ids, [poly_feature.id()],
-                                   self, join_val=join_val)
+        dlg = EditAttributesDialog(p_layer, poly_layer, point_ids, [poly_feature.id()], self)
         dlg.exec_()
 
         # เคลียร์ไฮไลท์และ selection หลังปิดหน้าต่างแก้ไข
@@ -590,6 +824,9 @@ class PathFilterTool(QDialog):
     # ---------- ปิดหน้าต่าง: เก็บกวาดเครื่องมือและไฮไลท์ ----------
     def closeEvent(self, event):
         self.clear_highlight()
+        if self.results_dlg:
+            self.results_dlg.close()
+            self.results_dlg = None
         canvas = self.iface.mapCanvas()
         if self.parcel_tool and canvas.mapTool() == self.parcel_tool:
             canvas.unsetMapTool(self.parcel_tool)
@@ -598,17 +835,67 @@ class PathFilterTool(QDialog):
         super(PathFilterTool, self).closeEvent(event)
 
     # ---------- อัปเดตปลั๊กอิน ----------
+    def get_local_version(self):
+        """อ่านเลขเวอร์ชันจาก metadata.txt ในเครื่อง"""
+        try:
+            meta_path = os.path.join(os.path.dirname(__file__), "metadata.txt")
+            with open(meta_path, "r", encoding="utf-8-sig") as fh:
+                for line in fh:
+                    if line.strip().lower().startswith("version="):
+                        return line.split("=", 1)[1].strip()
+        except Exception:
+            pass
+        return None
+
+    def get_remote_version(self):
+        """อ่านเลขเวอร์ชันล่าสุดจาก metadata.txt บน GitHub"""
+        try:
+            with urllib.request.urlopen(GITHUB_METADATA_URL, timeout=15) as resp:
+                remote_text = resp.read().decode("utf-8-sig", errors="ignore")
+            for line in remote_text.splitlines():
+                if line.strip().lower().startswith("version="):
+                    return line.split("=", 1)[1].strip()
+        except Exception:
+            pass
+        return None
+
     def update_plugin(self):
         if "USERNAME" in GITHUB_UPDATE_URL:
             QMessageBox.warning(self, "ไม่พบลิงก์อัปเดต", "นักพัฒนาโปรดไปตั้งค่า GITHUB_UPDATE_URL ภายในไฟล์ main_logic.py ก่อนใช้งานฟังก์ชันนี้")
             return
 
-        reply = QMessageBox.question(self, "ยืนยันอัปเดต",
-            "อัปเดตเป็นเวอร์ชันล่าสุดเลยหรือไม่?",
-            QMessageBox.Yes | QMessageBox.No)
+        local_ver = self.get_local_version()
+        remote_ver = self.get_remote_version()
+        local_t = parse_version(local_ver)
+        remote_t = parse_version(remote_ver)
 
-        if reply == QMessageBox.No: return
+        # เช็คเวอร์ชันจาก GitHub ไม่ได้ (เน็ตมีปัญหา ฯลฯ) -> ถามว่าจะดาวน์โหลดทับเลยหรือไม่
+        if remote_t is None:
+            reply = QMessageBox.question(self, "ตรวจสอบเวอร์ชันไม่ได้",
+                "ไม่สามารถตรวจสอบเวอร์ชันล่าสุดจาก GitHub ได้\n(อินเทอร์เน็ตหรือลิงก์อาจมีปัญหา)\n\nต้องการดาวน์โหลดอัปเดตทับไปเลยหรือไม่?",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.download_and_install_update()
+            return
 
+        # เป็นเวอร์ชันล่าสุดอยู่แล้ว
+        if local_t is not None and remote_t <= local_t:
+            QMessageBox.information(self, "เป็นเวอร์ชันล่าสุดแล้ว",
+                f"คุณใช้เวอร์ชันล่าสุดอยู่แล้ว (เวอร์ชัน {local_ver})")
+            return
+
+        # พบเวอร์ชันใหม่กว่า -> มีปุ่มกดอัปเดตได้เลย
+        msg = QMessageBox(self)
+        msg.setWindowTitle("พบเวอร์ชันใหม่")
+        msg.setIcon(QMessageBox.Information)
+        msg.setText(f"พบเวอร์ชันใหม่: {remote_ver}\nเวอร์ชันปัจจุบันของคุณ: {local_ver if local_ver else 'ไม่ทราบ'}")
+        btn_update = msg.addButton("อัปเดตเลย", QMessageBox.AcceptRole)
+        msg.addButton("ไว้ภายหลัง", QMessageBox.RejectRole)
+        msg.exec_()
+        if msg.clickedButton() == btn_update:
+            self.download_and_install_update()
+
+    def download_and_install_update(self):
         try:
             plugin_dir = os.path.dirname(__file__)
             temp_dir = tempfile.mkdtemp()

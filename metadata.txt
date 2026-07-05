@@ -1,10 +1,10 @@
 [general]
 name=Path Filter & BND Editor
 description=Filter PATH , Edit Attribute UTM and BND_NAME with Map Tool
-about=เครื่องมือกรองข้อมูล แก้ไข Attribute และชื่อหมุดหลักเขต กรมที่ดิน
-version=2.9
+about=เครื่องมือกรองข้อมูล แก้ไข Attribute และชื่อหมุดหลักเขต กรมที่ดิน พัฒนาโดย นายภาคภูมิ สูบกำปัง วิศวกรรังวัดปฏิบัติการ กองเทคโนโลยีทำแผนที่
+version=3.1
 qgisMinimumVersion=3.0
-author=PARKPHUM S.
+author=นายภาคภูมิ สูบกำปัง (วิศวกรรังวัดปฏิบัติการ กองเทคโนโลยีทำแผนที่)
 email=poonza2538@gmail.com
 category=Vector
 icon=icon.png
