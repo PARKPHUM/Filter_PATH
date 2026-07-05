@@ -486,18 +486,14 @@ class FilterResultsDialog(QDialog):
             QPushButton { font-size: 10pt; font-weight: bold; padding: 6px; border-radius: 4px; }
         """)
 
-        n_poly = sum(1 for r in results if r[0] == "Polygon")
-        n_point = len(results) - n_poly
-
         layout = QVBoxLayout()
         layout.addWidget(QLabel(
-            f"พบทั้งหมด {len(results)} รายการ (แปลง {n_poly} | หมุด {n_point})\n"
-            "คลิกรายการเพื่อซูมไปที่ตำแหน่งนั้น"))
+            f"พบแปลงทั้งหมด {len(results)} แปลง\n"
+            "คลิกรายการเพื่อซูมไปที่แปลงนั้น"))
 
         self.list_widget = QListWidget()
         for typ, layer, fid, desc in results[:self.MAX_ITEMS]:
-            prefix = "[แปลง] " if typ == "Polygon" else "[หมุด] "
-            item = QListWidgetItem(prefix + desc)
+            item = QListWidgetItem("[แปลง] " + desc)
             item.setData(Qt.UserRole, (layer, fid))
             self.list_widget.addItem(item)
         if len(results) > self.MAX_ITEMS:
@@ -565,7 +561,7 @@ class PathFilterTool(QDialog):
         self.parcel_tool = None
         self.highlight_rb = None
         self.results_dlg = None
-        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.1")
+        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.2")
         self.setMinimumWidth(420)
 
         self.setStyleSheet("""
@@ -669,15 +665,15 @@ class PathFilterTool(QDialog):
                 layer.setSubsetString(subset_str)
                 layer.updateExtents()
 
-                count_before = len(results)
-                for f in layer.getFeatures():
-                    if typ == "Polygon":
-                        desc = self.describe_polygon(layer, f)
-                    else:
-                        desc = self.describe_point(layer, f)
-                    results.append((typ, layer, f.id(), desc))
+                # แสดงในหน้าต่างผลการค้นหาเฉพาะแปลง (Polygon) เท่านั้น
+                if typ == "Polygon":
+                    for f in layer.getFeatures():
+                        results.append((typ, layer, f.id(), self.describe_polygon(layer, f)))
+                    has_features = len(results) > 0
+                else:
+                    has_features = next(layer.getFeatures(QgsFeatureRequest().setLimit(1)), None) is not None
 
-                if len(results) > count_before and not layer.extent().isEmpty():
+                if has_features and not layer.extent().isEmpty():
                     combined_extent.combineExtentWith(layer.extent())
                     has_data = True
 
@@ -725,26 +721,16 @@ class PathFilterTool(QDialog):
             "เครื่องมือ", "คลิกซ้ายที่แปลงบนแผนที่เพื่อแก้ไข Attribute (คลิกขวาเพื่อยกเลิก)", level=0)
 
     def describe_polygon(self, poly_layer, feature):
-        """สร้างข้อความอธิบายแปลงสำหรับแสดงในเมนูเลือกแปลงที่ซ้อนกัน"""
+        """สร้างข้อความอธิบายแปลงสำหรับแสดงในเมนูเลือกแปลงและรายการผลการค้นหา"""
         idx_landno = poly_layer.fields().indexOf("LANDNO")
         if idx_landno == -1: idx_landno = poly_layer.fields().indexOf("LAND_NO")
-        idx_join = poly_layer.fields().indexOf(JOIN_FIELD)
         idx_parcel = poly_layer.fields().indexOf("PARCELNO")
+        idx_survey = poly_layer.fields().indexOf("SURVEYNO")
 
         landno = feature.attribute(idx_landno) if idx_landno != -1 else "-"
-        join_v = feature.attribute(idx_join) if idx_join != -1 else "-"
         parcel = feature.attribute(idx_parcel) if idx_parcel != -1 else "-"
-        return f"LANDNO: {landno} | PARCELNO: {parcel} | {JOIN_FIELD}: {join_v} | ID: {feature.id()}"
-
-    def describe_point(self, p_layer, feature):
-        """สร้างข้อความอธิบายหมุดสำหรับแสดงในรายการผลการค้นหา"""
-        idx_landno = p_layer.fields().indexOf("LANDNO")
-        if idx_landno == -1: idx_landno = p_layer.fields().indexOf("LAND_NO")
-        idx_join = p_layer.fields().indexOf(JOIN_FIELD)
-
-        landno = feature.attribute(idx_landno) if idx_landno != -1 else "-"
-        join_v = feature.attribute(idx_join) if idx_join != -1 else "-"
-        return f"ID: {feature.id()} | LANDNO: {landno} | {JOIN_FIELD}: {join_v}"
+        survey = feature.attribute(idx_survey) if idx_survey != -1 else "-"
+        return f"LANDNO: {landno} | PARCELNO: {parcel} | SURVEYNO: {survey} | ID: {feature.id()}"
 
     def clear_highlight(self):
         if self.highlight_rb:
