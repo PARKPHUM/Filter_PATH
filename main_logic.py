@@ -29,8 +29,8 @@ GITHUB_METADATA_URL = "https://raw.githubusercontent.com/PARKPHUM/Filter_PATH/ma
 # =====================================================================
 PLUGIN_AUTHOR = "นายภาคภูมิ สูบกำปัง (วิศวกรรังวัดปฏิบัติการ กองเทคโนโลยีทำแผนที่)"
 
-# ชื่อคอลัมน์ที่ใช้เชื่อมโยงระหว่างแปลง (Polygon) กับหมุด (Point)
-JOIN_FIELD = "JOIN"
+# ระยะคลาดเคลื่อนสูงสุด (หน่วยแผนที่ เช่น เมตร) ที่ยอมรับว่าหมุดอยู่ตรงมุมเขต (Vertex) ของแปลง
+VERTEX_TOLERANCE = 0.10
 
 
 def escape_sql(value):
@@ -118,10 +118,10 @@ class EditBndNameDialog(QDialog):
             QMessageBox.warning(self, "ข้อผิดพลาด", "ไม่สามารถบันทึกข้อมูลลงไฟล์ได้")
 
 
-# --- 2. หน้าต่างสำหรับแก้ไข Attribute (แปลงที่คลิกเลือก + หมุดที่ JOIN ตรงกัน) ---
+# --- 2. หน้าต่างสำหรับแก้ไข Attribute (แปลงที่คลิกเลือก + หมุดที่อยู่ตรงมุมเขตของแปลง) ---
 class EditAttributesDialog(QDialog):
     def __init__(self, point_layer, poly_layer, selected_point_ids, selected_poly_ids,
-                 parent=None):
+                 parent=None, multi_mode=False):
         super(EditAttributesDialog, self).__init__(parent)
         self.setWindowTitle("แก้ไข Attribute และคำนวณ PATH ใหม่")
         self.setMinimumWidth(400)
@@ -129,6 +129,8 @@ class EditAttributesDialog(QDialog):
         self.poly_layer = poly_layer
         self.selected_point_ids = selected_point_ids
         self.selected_poly_ids = selected_poly_ids
+        # โหมดแก้ไขหลายแปลงพร้อมกัน: ไม่แสดงช่อง LANDNO และคง LANDNO เดิมของแต่ละแปลง
+        self.multi_mode = multi_mode
 
         self.fields_to_edit = ["UTMMAP1", "UTMMAP2", "UTMMAP3", "UTMSCALE", "UTMMAP4"]
         self.landno_alias = ["LANDNO", "LAND_NO"]
@@ -144,6 +146,8 @@ class EditAttributesDialog(QDialog):
 
         # สรุปว่ากำลังจะแก้ไขอะไรบ้าง
         info_text = f"จะแก้ไข: แปลง {len(selected_poly_ids)} แปลง | หมุด {len(selected_point_ids)} จุด"
+        if self.multi_mode:
+            info_text += "\n(แก้ไขหลายแปลง: LANDNO ของแต่ละแปลงจะคงเดิม)"
         info_label = QLabel(info_text)
         info_label.setStyleSheet("color: #c0392b; font-size: 10pt;")
         main_layout.addWidget(info_label)
@@ -177,14 +181,16 @@ class EditAttributesDialog(QDialog):
                     self.actual_landno_field = name
                     break
 
-        self.landno_input = QLineEdit()
-        if sample_feature:
-            idx = base_layer_for_landno.fields().indexOf(self.actual_landno_field)
-            if idx != -1:
-                val = sample_feature.attribute(idx)
-                if val: self.landno_input.setText(str(val))
+        self.landno_input = None
+        if not self.multi_mode:
+            self.landno_input = QLineEdit()
+            if sample_feature:
+                idx = base_layer_for_landno.fields().indexOf(self.actual_landno_field)
+                if idx != -1:
+                    val = sample_feature.attribute(idx)
+                    if val: self.landno_input.setText(str(val))
 
-        form_layout.addRow(QLabel(f"LANDNO ({self.actual_landno_field}):"), self.landno_input)
+            form_layout.addRow(QLabel(f"LANDNO ({self.actual_landno_field}):"), self.landno_input)
         form_group.setLayout(form_layout)
         main_layout.addWidget(form_group)
 
@@ -202,7 +208,7 @@ class EditAttributesDialog(QDialog):
             layers_data.append((self.poly_layer, self.selected_poly_ids))
 
         data = {f: self.inputs[f].text().strip() for f in self.fields_to_edit}
-        landno_val = self.landno_input.text().strip()
+        landno_val = self.landno_input.text().strip() if self.landno_input else ""
         sample_new_path = ""
         errors = []
 
@@ -227,7 +233,7 @@ class EditAttributesDialog(QDialog):
                     if f_idx != -1:
                         layer.changeAttributeValue(f.id(), f_idx, val)
 
-                if landno_idx != -1:
+                if landno_idx != -1 and not self.multi_mode:
                     layer.changeAttributeValue(f.id(), landno_idx, landno_val)
 
                 if path_idx != -1:
@@ -242,9 +248,16 @@ class EditAttributesDialog(QDialog):
                     elif len(parts) >= 2 and not old_path_str.startswith("\\\\"):
                         prefix = f"{parts[0]}\\{parts[1]}"
 
+                    # โหมดหลายแปลง: ใช้ LANDNO เดิมของแปลงนั้นๆ ต่อท้าย PATH แทนค่าจากช่องกรอก
+                    if self.multi_mode:
+                        own = f.attribute(landno_idx) if landno_idx != -1 else None
+                        landno_for_path = str(own).strip() if own is not None and str(own).strip() not in ("", "NULL") else ""
+                    else:
+                        landno_for_path = landno_val
+
                     suffix_parts = [data[field] for field in self.fields_to_edit if data[field]]
-                    if landno_val:
-                        suffix_parts.append(landno_val)
+                    if landno_for_path:
+                        suffix_parts.append(landno_for_path)
 
                     new_path = prefix + "\\" + "\\".join(suffix_parts)
                     sample_new_path = new_path
@@ -276,12 +289,34 @@ class ParcelClickTool(QgsMapToolEmitPoint):
         self.setCursor(Qt.CrossCursor)
         self.hover_rb = None
         self.hover_fid = None
+        self.selected_feats = {}   # fid -> (feature, rubber band) สำหรับโหมดเลือกหลายแปลง
 
     def clear_hover(self):
         if self.hover_rb:
             self.canvas.scene().removeItem(self.hover_rb)
             self.hover_rb = None
         self.hover_fid = None
+
+    def clear_selection(self):
+        for feat, rb in self.selected_feats.values():
+            self.canvas.scene().removeItem(rb)
+        self.selected_feats = {}
+
+    def toggle_selection(self, feature, poly_layer):
+        """Shift+คลิก: เพิ่ม/เอาออกแปลงจากรายการเลือกสะสม พร้อมกรอบสีน้ำเงิน"""
+        fid = feature.id()
+        if fid in self.selected_feats:
+            _, rb = self.selected_feats.pop(fid)
+            self.canvas.scene().removeItem(rb)
+        else:
+            rb = QgsRubberBand(self.canvas, QgsWkbTypes.PolygonGeometry)
+            rb.setToGeometry(feature.geometry(), poly_layer)
+            rb.setColor(QColor(0, 120, 255, 60))
+            rb.setStrokeColor(QColor(0, 90, 220))
+            rb.setWidth(3)
+            self.selected_feats[fid] = (feature, rb)
+        self.parent_dialog.iface.messageBar().pushMessage(
+            "แจ้ง", f"เลือกไว้ {len(self.selected_feats)} แปลง (คลิกขวาเพื่อเปิดหน้าต่างแก้ไข)", level=0)
 
     def show_hover(self, geom, layer):
         self.clear_hover()
@@ -330,9 +365,15 @@ class ParcelClickTool(QgsMapToolEmitPoint):
     def canvasReleaseEvent(self, e):
         if e.button() == Qt.RightButton:
             self.clear_hover()
-            self.canvas.unsetMapTool(self)
-            self.parent_dialog.iface.messageBar().pushMessage(
-                "แจ้ง", "ยกเลิกเครื่องมือคลิกเลือกแปลงแล้ว", level=0)
+            # ถ้ามีแปลงที่เลือกสะสมไว้ (Shift+คลิก) -> คลิกขวาเปิดหน้าต่างแก้ไข
+            if self.selected_feats:
+                feats = [feat for feat, _ in self.selected_feats.values()]
+                self.clear_selection()
+                self.parent_dialog.start_edit_for_polygons(feats)
+            else:
+                self.canvas.unsetMapTool(self)
+                self.parent_dialog.iface.messageBar().pushMessage(
+                    "แจ้ง", "ยกเลิกเครื่องมือคลิกเลือกแปลงแล้ว", level=0)
             return
 
         poly_layer = self.parent_dialog.poly_combo.currentLayer()
@@ -363,9 +404,15 @@ class ParcelClickTool(QgsMapToolEmitPoint):
                 "แจ้งเตือน", "ไม่พบแปลงบริเวณที่คลิก (ถ้ามีการ Filter อยู่ จะหาเจอเฉพาะแปลงที่ผ่าน Filter)", level=1)
             return
 
+        multi = bool(e.modifiers() & Qt.ShiftModifier)
+
         if len(candidates) == 1:
             self.clear_hover()
-            self.parent_dialog.start_edit_for_polygon(candidates[0])
+            if multi:
+                self.toggle_selection(candidates[0], poly_layer)
+            else:
+                self.clear_selection()
+                self.parent_dialog.start_edit_for_polygons([candidates[0]])
             return
 
         # กรณีแปลงซ้อนกัน: แสดงเมนูรายการให้เลือก พร้อมไฮไลท์ขอบเขตแปลงตอนเลื่อนเมาส์บนเมนู
@@ -391,10 +438,15 @@ class ParcelClickTool(QgsMapToolEmitPoint):
         chosen = menu.exec_(QCursor.pos())
         self.clear_hover()
         if chosen in action_map:
-            self.parent_dialog.start_edit_for_polygon(action_map[chosen])
+            if multi:
+                self.toggle_selection(action_map[chosen], poly_layer)
+            else:
+                self.clear_selection()
+                self.parent_dialog.start_edit_for_polygons([action_map[chosen]])
 
     def deactivate(self):
         self.clear_hover()
+        self.clear_selection()
         super(ParcelClickTool, self).deactivate()
 
 
@@ -534,6 +586,10 @@ class FilterResultsDialog(QDialog):
 
         self.setLayout(layout)
 
+        # ขยายความกว้างหน้าต่างอัตโนมัติให้พอดีกับข้อความที่ยาวที่สุดในรายการ
+        content_w = self.list_widget.sizeHintForColumn(0) + 60
+        self.resize(max(420, min(content_w, 1000)), 380)
+
     def zoom_to_item(self, item):
         data = item.data(Qt.UserRole)
         if not data:
@@ -575,9 +631,9 @@ class PathFilterTool(QDialog):
         self.iface = iface
         self.edit_tool = None
         self.parcel_tool = None
-        self.highlight_rb = None
+        self.highlight_rbs = []
         self.results_dlg = None
-        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.3")
+        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.5")
         self.setMinimumWidth(420)
 
         self.setStyleSheet("""
@@ -634,7 +690,7 @@ class PathFilterTool(QDialog):
         self.btn_edit_attr.clicked.connect(self.activate_parcel_edit_tool)
         layout.addWidget(self.btn_edit_attr)
 
-        hint = QLabel("* คลิกซ้ายที่แปลง = แก้ไขแปลง | คลิกขวา = ยกเลิก")
+        hint = QLabel("* คลิกซ้าย = แก้ไข 1 แปลง | Shift+คลิกซ้าย = เลือกหลายแปลง | คลิกขวา = เปิดแก้ไข/ยกเลิก")
         hint.setStyleSheet("font-size: 9pt; font-weight: normal; color: #666;")
         layout.addWidget(hint)
 
@@ -734,7 +790,7 @@ class PathFilterTool(QDialog):
         self.parcel_tool = ParcelClickTool(canvas, self)
         canvas.setMapTool(self.parcel_tool)
         self.iface.messageBar().pushMessage(
-            "เครื่องมือ", "คลิกซ้ายที่แปลงบนแผนที่เพื่อแก้ไข Attribute (คลิกขวาเพื่อยกเลิก)", level=0)
+            "เครื่องมือ", "คลิกซ้าย = แก้ไข 1 แปลง | Shift+คลิกซ้าย = เลือกสะสมหลายแปลง แล้วคลิกขวาเพื่อเปิดหน้าต่างแก้ไข", level=0)
 
     def describe_polygon(self, poly_layer, feature):
         """สร้างข้อความอธิบายแปลงสำหรับแสดงในเมนูเลือกแปลงและรายการผลการค้นหา"""
@@ -758,60 +814,88 @@ class PathFilterTool(QDialog):
                 f"AREA: {area} | ID: {feature.id()}")
 
     def clear_highlight(self):
-        if self.highlight_rb:
-            self.iface.mapCanvas().scene().removeItem(self.highlight_rb)
-            self.highlight_rb = None
+        for rb in self.highlight_rbs:
+            self.iface.mapCanvas().scene().removeItem(rb)
+        self.highlight_rbs = []
 
-    def start_edit_for_polygon(self, poly_feature):
+    def find_points_on_vertices(self, p_layer, poly_layer, poly_features, tol=VERTEX_TOLERANCE):
+        """หาหมุดที่ตำแหน่งตรงกับมุมเขต (Vertex) ของแปลงที่เลือก
+        โดยยอมรับระยะคลาดเคลื่อนไม่เกิน tol หน่วยแผนที่ (ค้นเฉพาะหมุดที่ผ่าน Filter อยู่)"""
+        # แปลงขอบเขตแปลงให้อยู่ใน CRS ของ Layer หมุด (กันกรณี CRS ไม่ตรงกัน)
+        transform = None
+        if poly_layer.crs() != p_layer.crs():
+            try:
+                transform = QgsCoordinateTransform(poly_layer.crs(), p_layer.crs(), QgsProject.instance())
+            except Exception:
+                transform = None
+
+        tol2 = tol * tol
+        point_ids = []
+        seen = set()
+        for pf in poly_features:
+            geom = QgsGeometry(pf.geometry())
+            if geom.isEmpty():
+                continue
+            if transform:
+                try:
+                    geom.transform(transform)
+                except Exception:
+                    continue
+
+            bbox = geom.boundingBox()
+            bbox.grow(tol)
+            request = QgsFeatureRequest().setFilterRect(bbox).setSubsetOfAttributes([])
+            for f in p_layer.getFeatures(request):
+                if f.id() in seen:
+                    continue
+                g = f.geometry()
+                if not g:
+                    continue
+                try:
+                    p = g.asPoint()
+                except Exception:
+                    p = g.centroid().asPoint()
+                # ระยะจากหมุดไปยัง Vertex ที่ใกล้ที่สุดของแปลง
+                _, _, _, _, sqr_dist = geom.closestVertex(p)
+                if 0 <= sqr_dist <= tol2:
+                    seen.add(f.id())
+                    point_ids.append(f.id())
+        return point_ids
+
+    def start_edit_for_polygons(self, poly_features):
         poly_layer = self.poly_combo.currentLayer()
         p_layer = self.point_combo.currentLayer()
-        if not poly_layer:
+        if not poly_layer or not poly_features:
             return
 
-        # ไฮไลท์แปลงที่เลือกไว้ระหว่างแก้ไข
+        multi_mode = len(poly_features) > 1
+
+        # ไฮไลท์แปลงที่เลือกไว้ (กรอบแดง) ค้างไว้ระหว่างแก้ไข
         self.clear_highlight()
-        self.highlight_rb = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.PolygonGeometry)
-        self.highlight_rb.setToGeometry(poly_feature.geometry(), poly_layer)
-        self.highlight_rb.setColor(QColor(255, 0, 0, 50))
-        self.highlight_rb.setStrokeColor(QColor(220, 0, 0))
-        self.highlight_rb.setWidth(3)
+        for pf in poly_features:
+            rb = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.PolygonGeometry)
+            rb.setToGeometry(pf.geometry(), poly_layer)
+            rb.setColor(QColor(255, 0, 0, 50))
+            rb.setStrokeColor(QColor(220, 0, 0))
+            rb.setWidth(3)
+            self.highlight_rbs.append(rb)
 
-        # หาค่า JOIN ของแปลง เพื่อไปหาหมุดที่เชื่อมโยงกัน
-        join_val = None
-        join_idx = poly_layer.fields().indexOf(JOIN_FIELD)
-        if join_idx != -1:
-            v = poly_feature.attribute(join_idx)
-            if v is not None and str(v).strip() not in ("", "NULL"):
-                join_val = str(v).strip()
-
+        # หาหมุดที่ตำแหน่งตรงกับมุมเขต (Vertex) ของแปลงที่เลือกเท่านั้น
         point_ids = []
-        if p_layer and join_val is not None:
-            pt_join_idx = p_layer.fields().indexOf(JOIN_FIELD)
-            if pt_join_idx == -1:
+        if p_layer:
+            point_ids = self.find_points_on_vertices(p_layer, poly_layer, poly_features)
+            if not point_ids:
                 self.iface.messageBar().pushMessage(
-                    "แจ้งเตือน", f"Layer หมุดไม่มีคอลัมน์ '{JOIN_FIELD}' จะแก้ไขเฉพาะแปลงเท่านั้น", level=1)
-            else:
-                fld = p_layer.fields().field(pt_join_idx)
-                if fld.isNumeric():
-                    try:
-                        float(join_val)
-                        expr = f'"{JOIN_FIELD}" = {join_val}'
-                    except ValueError:
-                        expr = f"\"{JOIN_FIELD}\" = '{escape_sql(join_val)}'"
-                else:
-                    expr = f"\"{JOIN_FIELD}\" = '{escape_sql(join_val)}'"
-                request = QgsFeatureRequest().setFilterExpression(expr)
-                point_ids = [f.id() for f in p_layer.getFeatures(request)]
-        elif join_idx == -1:
-            self.iface.messageBar().pushMessage(
-                "แจ้งเตือน", f"Layer แปลงไม่มีคอลัมน์ '{JOIN_FIELD}' จะแก้ไขเฉพาะแปลงเท่านั้น", level=1)
+                    "แจ้งเตือน", "ไม่พบหมุดที่ตำแหน่งตรงกับมุมเขตของแปลงที่เลือก จะแก้ไขเฉพาะแปลงเท่านั้น", level=1)
 
         # เลือก Feature บนแผนที่ให้เห็นชัดๆ ว่าจะแก้ตัวไหนบ้าง
-        poly_layer.selectByIds([poly_feature.id()])
+        poly_ids = [pf.id() for pf in poly_features]
+        poly_layer.selectByIds(poly_ids)
         if p_layer:
             p_layer.selectByIds(point_ids)
 
-        dlg = EditAttributesDialog(p_layer, poly_layer, point_ids, [poly_feature.id()], self)
+        dlg = EditAttributesDialog(p_layer, poly_layer, point_ids, poly_ids,
+                                   self, multi_mode=multi_mode)
         dlg.exec_()
 
         # เคลียร์ไฮไลท์และ selection หลังปิดหน้าต่างแก้ไข
