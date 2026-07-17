@@ -36,6 +36,11 @@ VERTEX_TOLERANCE = 0.10
 # กันกรณีมุมเขตของแปลงข้างเคียง/แปลงซ้อนอยู่ใกล้กันจนหมุดของแปลงอื่นโดนแก้ไปด้วย
 ATTR_MATCH_FIELDS = ["FILE_NAME"]
 
+# คอลัมน์และค่าที่ใช้ทำเครื่องหมายว่า "แปลงนี้เป็นแปลงที่ถูกต้อง"
+# (ติ๊กในหน้าต่างผลการค้นหา เพื่อคัดแปลงที่ต้องการออกจากรายการที่ซ้ำกัน)
+CORRECT_FLAG_FIELD = "OWNERNAME"
+CORRECT_FLAG_VALUE = "1"
+
 
 def escape_sql(value):
     """กัน single quote ในค่าที่ผู้ใช้กรอก ไม่ให้ expression พัง"""
@@ -64,6 +69,23 @@ def format_area_value(v):
     except ValueError:
         pass
     return s
+
+
+def normalize_match_value(v):
+    """ปรับค่าให้เทียบกันได้ข้ามชนิดข้อมูล เช่น 56916.0 (ตัวเลข) กับ '56916' (ข้อความ)
+    คืนค่าเป็นข้อความตัวพิมพ์เล็ก ตัดช่องว่างหัวท้าย, ค่าว่าง/NULL คืน '' """
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if s == "NULL":
+        return ""
+    try:
+        f = float(s)
+        if f == int(f):
+            s = str(int(f))
+    except (ValueError, OverflowError):
+        pass
+    return s.lower()
 
 
 # --- 1. หน้าต่างสำหรับการกรอกชื่อหมุดหลักเขตใหม่ (POINT) ---
@@ -541,7 +563,7 @@ class PointSelectTool(QgsMapToolEmitPoint):
         super(PointSelectTool, self).deactivate()
 
 
-# --- 4.5 หน้าต่างแสดงผลการค้นหา (คลิกรายการเพื่อซูมไปที่รายการนั้น) ---
+# --- 4.5 หน้าต่างแสดงผลการค้นหา (คลิกรายการเพื่อซูม / ติ๊กเพื่อทำเครื่องหมายแปลงที่ถูกต้อง) ---
 class FilterResultsDialog(QDialog):
     MAX_ITEMS = 300
 
@@ -561,19 +583,25 @@ class FilterResultsDialog(QDialog):
         layout = QVBoxLayout()
         layout.addWidget(QLabel(
             f"พบแปลงทั้งหมด {len(results)} แปลง\n"
-            "คลิกรายการเพื่อซูมไปที่แปลงนั้น"))
+            f"คลิกรายการ = ซูมไปที่แปลงนั้น | ติ๊กถูก = แปลงที่ถูกต้อง ({CORRECT_FLAG_FIELD} = {CORRECT_FLAG_VALUE})"))
 
         self.list_widget = QListWidget()
+        self.list_widget.blockSignals(True)
         for typ, layer, fid, desc in results[:self.MAX_ITEMS]:
             item = QListWidgetItem("[แปลง] " + desc)
             item.setData(Qt.UserRole, (layer, fid))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if self.is_flagged(layer, fid) else Qt.Unchecked)
             self.list_widget.addItem(item)
         if len(results) > self.MAX_ITEMS:
             note = QListWidgetItem(
                 f"... และอีก {len(results) - self.MAX_ITEMS} รายการ (แสดงเฉพาะ {self.MAX_ITEMS} รายการแรก)")
             note.setFlags(Qt.NoItemFlags)
             self.list_widget.addItem(note)
+        self.list_widget.blockSignals(False)
+
         self.list_widget.itemClicked.connect(self.zoom_to_item)
+        self.list_widget.itemChanged.connect(self.on_item_checked)
         layout.addWidget(self.list_widget)
 
         row = QHBoxLayout()
@@ -590,9 +618,64 @@ class FilterResultsDialog(QDialog):
 
         self.setLayout(layout)
 
-        # ขยายความกว้างหน้าต่างอัตโนมัติให้พอดีกับข้อความที่ยาวที่สุดในรายการ
-        content_w = self.list_widget.sizeHintForColumn(0) + 60
+        # ขยายความกว้างหน้าต่างอัตโนมัติให้พอดีกับข้อความที่ยาวที่สุดในรายการ (เผื่อที่ช่องติ๊ก)
+        content_w = self.list_widget.sizeHintForColumn(0) + 90
         self.resize(max(420, min(content_w, 1000)), 380)
+
+    # ---------- ติ๊กทำเครื่องหมายแปลงที่ถูกต้อง ----------
+    def is_flagged(self, layer, fid):
+        """เช็คว่าแปลงนี้ถูกทำเครื่องหมายว่าเป็นแปลงที่ถูกต้องไว้แล้วหรือยัง"""
+        idx = layer.fields().indexOf(CORRECT_FLAG_FIELD)
+        if idx == -1:
+            return False
+        f = layer.getFeature(fid)
+        if not f.isValid():
+            return False
+        return normalize_match_value(f.attribute(idx)) == normalize_match_value(CORRECT_FLAG_VALUE)
+
+    def set_item_check_silently(self, item, state):
+        """ย้อนสถานะติ๊กกลับโดยไม่ให้ signal ยิงซ้ำ"""
+        self.list_widget.blockSignals(True)
+        item.setCheckState(state)
+        self.list_widget.blockSignals(False)
+
+    def on_item_checked(self, item):
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+        layer, fid = data
+        checked = item.checkState() == Qt.Checked
+
+        idx = layer.fields().indexOf(CORRECT_FLAG_FIELD)
+        if idx == -1:
+            QMessageBox.warning(self, "ไม่พบคอลัมน์",
+                                f"Layer แปลงไม่มีคอลัมน์ '{CORRECT_FLAG_FIELD}' จึงบันทึกเครื่องหมายไม่ได้")
+            self.set_item_check_silently(item, Qt.Unchecked if checked else Qt.Checked)
+            return
+
+        # ติ๊ก = ใส่ค่า, เอาติ๊กออก = ล้างค่า (ชนิดค่าตามชนิดคอลัมน์)
+        fld = layer.fields().field(idx)
+        if checked:
+            new_val = int(CORRECT_FLAG_VALUE) if fld.isNumeric() else CORRECT_FLAG_VALUE
+        else:
+            new_val = None if fld.isNumeric() else ""
+
+        if not layer.isEditable():
+            layer.startEditing()
+        layer.changeAttributeValue(fid, idx, new_val)
+
+        if layer.commitChanges():
+            self.iface.messageBar().pushMessage(
+                "บันทึกแล้ว",
+                f"{'ทำเครื่องหมาย' if checked else 'ยกเลิกเครื่องหมาย'}แปลง ID {fid} "
+                f"({CORRECT_FLAG_FIELD} = {CORRECT_FLAG_VALUE if checked else 'ว่าง'})",
+                level=0)
+        else:
+            errs = "; ".join(layer.commitErrors())
+            layer.rollBack()
+            QMessageBox.critical(self, "บันทึกไม่สำเร็จ",
+                                 f"ไม่สามารถบันทึกลงไฟล์ได้:\n{errs}")
+            self.set_item_check_silently(item, Qt.Unchecked if checked else Qt.Checked)
 
     def zoom_to_item(self, item):
         data = item.data(Qt.UserRole)
@@ -637,7 +720,7 @@ class PathFilterTool(QDialog):
         self.parcel_tool = None
         self.highlight_rbs = []
         self.results_dlg = None
-        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.6")
+        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.8")
         self.setMinimumWidth(420)
 
         self.setStyleSheet("""
@@ -850,6 +933,7 @@ class PathFilterTool(QDialog):
         tol2 = tol * tol
         point_ids = []
         seen = set()
+        fallback_used = False
         for pf in poly_features:
             geom = QgsGeometry(pf.geometry())
             if geom.isEmpty():
@@ -863,14 +947,17 @@ class PathFilterTool(QDialog):
             # ค่าประจำแปลงนี้ (เช่น FILE_NAME) ไว้เทียบกับหมุดแต่ละตัว
             expected = []
             for poly_idx, pt_idx in match_pairs:
-                v = pf.attribute(poly_idx)
-                if v is not None and str(v).strip() not in ("", "NULL"):
-                    expected.append((pt_idx, str(v).strip().lower()))
+                val = normalize_match_value(pf.attribute(poly_idx))
+                if val:
+                    expected.append((pt_idx, val))
 
             bbox = geom.boundingBox()
             bbox.grow(tol)
             attr_subset = [pt_idx for pt_idx, _ in expected]
             request = QgsFeatureRequest().setFilterRect(bbox).setSubsetOfAttributes(attr_subset)
+
+            vertex_hits = []   # หมุดที่ตำแหน่งตรง Vertex ของแปลงนี้
+            attr_hits = []     # หมุดที่ตรงทั้งตำแหน่งและค่าคอลัมน์ระบุงาน (FILE_NAME)
             for f in p_layer.getFeatures(request):
                 if f.id() in seen:
                     continue
@@ -878,26 +965,39 @@ class PathFilterTool(QDialog):
                 if not g:
                     continue
 
-                # เงื่อนไข 1: ค่าคอลัมน์ระบุงานของหมุดต้องตรงกับแปลง (กันหมุดแปลงอื่นที่อยู่ชิดกัน)
-                matched = True
-                for pt_idx, exp_val in expected:
-                    pv = f.attribute(pt_idx)
-                    pv_s = str(pv).strip().lower() if pv is not None else ""
-                    if pv_s != exp_val:
-                        matched = False
-                        break
-                if not matched:
-                    continue
-
-                # เงื่อนไข 2: ตำแหน่งต้องตรงกับ Vertex ของแปลง
+                # ตำแหน่งต้องตรงกับ Vertex ของแปลงก่อน
                 try:
                     p = g.asPoint()
                 except Exception:
                     p = g.centroid().asPoint()
                 _, _, _, _, sqr_dist = geom.closestVertex(p)
-                if 0 <= sqr_dist <= tol2:
-                    seen.add(f.id())
-                    point_ids.append(f.id())
+                if not (0 <= sqr_dist <= tol2):
+                    continue
+                vertex_hits.append(f.id())
+
+                # แล้วจึงเช็คค่าคอลัมน์ระบุงานว่าตรงกับแปลงหรือไม่ (กันหมุดแปลงอื่นที่อยู่ชิดกัน)
+                if expected and all(normalize_match_value(f.attribute(pt_idx)) == exp_val
+                                    for pt_idx, exp_val in expected):
+                    attr_hits.append(f.id())
+
+            # ใช้ชุดที่ผ่านทั้ง 2 เงื่อนไขก่อน แต่ถ้าค่าคอลัมน์ไม่ตรงเลยสักหมุด
+            # ให้ถอยไปใช้ตำแหน่ง Vertex อย่างเดียว (กันกรณีข้อมูล FILE_NAME สอง Layer เก็บไม่ตรงกัน)
+            if expected and attr_hits:
+                chosen_ids = attr_hits
+            else:
+                chosen_ids = vertex_hits
+                if expected and vertex_hits:
+                    fallback_used = True
+
+            for fid in chosen_ids:
+                seen.add(fid)
+                point_ids.append(fid)
+
+        if fallback_used:
+            self.iface.messageBar().pushMessage(
+                "แจ้งเตือน",
+                "ค่า FILE_NAME ของหมุดไม่ตรงกับของแปลงที่เลือก จึงจับคู่จากตำแหน่ง Vertex แทน (ควรตรวจสอบข้อมูล FILE_NAME ของทั้งสอง Layer)",
+                level=1)
         return point_ids
 
     def start_edit_for_polygons(self, poly_features):
