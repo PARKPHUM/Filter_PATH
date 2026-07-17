@@ -32,6 +32,10 @@ PLUGIN_AUTHOR = "นายภาคภูมิ สูบกำปัง (วิ
 # ระยะคลาดเคลื่อนสูงสุด (หน่วยแผนที่ เช่น เมตร) ที่ยอมรับว่าหมุดอยู่ตรงมุมเขต (Vertex) ของแปลง
 VERTEX_TOLERANCE = 0.10
 
+# คอลัมน์ Attribute ที่ใช้ยืนยันว่าหมุดกับแปลงเป็นงานเดียวกัน (ใช้ร่วมกับการเช็คตำแหน่ง Vertex)
+# กันกรณีมุมเขตของแปลงข้างเคียง/แปลงซ้อนอยู่ใกล้กันจนหมุดของแปลงอื่นโดนแก้ไปด้วย
+ATTR_MATCH_FIELDS = ["FILE_NAME"]
+
 
 def escape_sql(value):
     """กัน single quote ในค่าที่ผู้ใช้กรอก ไม่ให้ expression พัง"""
@@ -633,7 +637,7 @@ class PathFilterTool(QDialog):
         self.parcel_tool = None
         self.highlight_rbs = []
         self.results_dlg = None
-        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.5")
+        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.6")
         self.setMinimumWidth(420)
 
         self.setStyleSheet("""
@@ -819,8 +823,9 @@ class PathFilterTool(QDialog):
         self.highlight_rbs = []
 
     def find_points_on_vertices(self, p_layer, poly_layer, poly_features, tol=VERTEX_TOLERANCE):
-        """หาหมุดที่ตำแหน่งตรงกับมุมเขต (Vertex) ของแปลงที่เลือก
-        โดยยอมรับระยะคลาดเคลื่อนไม่เกิน tol หน่วยแผนที่ (ค้นเฉพาะหมุดที่ผ่าน Filter อยู่)"""
+        """หาหมุดของแปลงที่เลือก โดยใช้ 2 เงื่อนไขร่วมกัน (ค้นเฉพาะหมุดที่ผ่าน Filter อยู่):
+        1) ค่าคอลัมน์ระบุงาน (เช่น FILE_NAME) ของหมุดต้องตรงกับของแปลง
+        2) ตำแหน่งหมุดต้องตรงกับมุมเขต (Vertex) ของแปลง คลาดเคลื่อนไม่เกิน tol หน่วยแผนที่"""
         # แปลงขอบเขตแปลงให้อยู่ใน CRS ของ Layer หมุด (กันกรณี CRS ไม่ตรงกัน)
         transform = None
         if poly_layer.crs() != p_layer.crs():
@@ -828,6 +833,19 @@ class PathFilterTool(QDialog):
                 transform = QgsCoordinateTransform(poly_layer.crs(), p_layer.crs(), QgsProject.instance())
             except Exception:
                 transform = None
+
+        # จับคู่ index คอลัมน์ระบุงานที่มีอยู่จริงครบทั้งสอง Layer
+        match_pairs = []
+        for name in ATTR_MATCH_FIELDS:
+            poly_idx = poly_layer.fields().indexOf(name)
+            pt_idx = p_layer.fields().indexOf(name)
+            if poly_idx != -1 and pt_idx != -1:
+                match_pairs.append((poly_idx, pt_idx))
+        if not match_pairs:
+            self.iface.messageBar().pushMessage(
+                "แจ้งเตือน",
+                f"ไม่พบคอลัมน์ {'/'.join(ATTR_MATCH_FIELDS)} ครบทั้งสอง Layer จะจับคู่หมุดจากตำแหน่ง Vertex เพียงอย่างเดียว",
+                level=1)
 
         tol2 = tol * tol
         point_ids = []
@@ -842,20 +860,40 @@ class PathFilterTool(QDialog):
                 except Exception:
                     continue
 
+            # ค่าประจำแปลงนี้ (เช่น FILE_NAME) ไว้เทียบกับหมุดแต่ละตัว
+            expected = []
+            for poly_idx, pt_idx in match_pairs:
+                v = pf.attribute(poly_idx)
+                if v is not None and str(v).strip() not in ("", "NULL"):
+                    expected.append((pt_idx, str(v).strip().lower()))
+
             bbox = geom.boundingBox()
             bbox.grow(tol)
-            request = QgsFeatureRequest().setFilterRect(bbox).setSubsetOfAttributes([])
+            attr_subset = [pt_idx for pt_idx, _ in expected]
+            request = QgsFeatureRequest().setFilterRect(bbox).setSubsetOfAttributes(attr_subset)
             for f in p_layer.getFeatures(request):
                 if f.id() in seen:
                     continue
                 g = f.geometry()
                 if not g:
                     continue
+
+                # เงื่อนไข 1: ค่าคอลัมน์ระบุงานของหมุดต้องตรงกับแปลง (กันหมุดแปลงอื่นที่อยู่ชิดกัน)
+                matched = True
+                for pt_idx, exp_val in expected:
+                    pv = f.attribute(pt_idx)
+                    pv_s = str(pv).strip().lower() if pv is not None else ""
+                    if pv_s != exp_val:
+                        matched = False
+                        break
+                if not matched:
+                    continue
+
+                # เงื่อนไข 2: ตำแหน่งต้องตรงกับ Vertex ของแปลง
                 try:
                     p = g.asPoint()
                 except Exception:
                     p = g.centroid().asPoint()
-                # ระยะจากหมุดไปยัง Vertex ที่ใกล้ที่สุดของแปลง
                 _, _, _, _, sqr_dist = geom.closestVertex(p)
                 if 0 <= sqr_dist <= tol2:
                     seen.add(f.id())
