@@ -30,11 +30,13 @@ GITHUB_METADATA_URL = "https://raw.githubusercontent.com/PARKPHUM/Filter_PATH/ma
 PLUGIN_AUTHOR = "นายภาคภูมิ สูบกำปัง (วิศวกรรังวัดปฏิบัติการ กองเทคโนโลยีทำแผนที่)"
 
 # ระยะคลาดเคลื่อนสูงสุด (หน่วยแผนที่ เช่น เมตร) ที่ยอมรับว่าหมุดอยู่ตรงมุมเขต (Vertex) ของแปลง
+# ใช้เฉพาะการ "ตรวจสอบเสริม" เพื่อเตือนข้อมูลผิดปกติ ไม่ได้ใช้ตัดสินว่าหมุดเป็นของแปลงใด
 VERTEX_TOLERANCE = 0.10
 
-# คอลัมน์ Attribute ที่ใช้ยืนยันว่าหมุดกับแปลงเป็นงานเดียวกัน (ใช้ร่วมกับการเช็คตำแหน่ง Vertex)
-# กันกรณีมุมเขตของแปลงข้างเคียง/แปลงซ้อนอยู่ใกล้กันจนหมุดของแปลงอื่นโดนแก้ไปด้วย
-ATTR_MATCH_FIELDS = ["FILE_NAME"]
+# คอลัมน์รหัสแปลง ใช้เป็นคีย์จับคู่ว่า "หมุด (POINT) จุดนี้เป็นของแปลง (POLYGON) ใด"
+# หมุดจะถูกเลือกมาแก้ไขก็ต่อเมื่อค่านี้ตรงกับแปลงที่คลิกเลือกเท่านั้น
+# (ห้ามใช้ตำแหน่ง Vertex ตัดสิน เพราะแปลงที่เชื่อมต่อกันมีหมุดซ้อนทับกันสนิทที่มุมเขตเดียวกัน)
+PARCEL_KEY_FIELD = "PARCELDESC"
 
 # คอลัมน์และค่าที่ใช้ทำเครื่องหมายว่า "แปลงนี้เป็นแปลงที่ถูกต้อง"
 # (ติ๊กในหน้าต่างผลการค้นหา เพื่อคัดแปลงที่ต้องการออกจากรายการที่ซ้ำกัน)
@@ -85,6 +87,22 @@ def normalize_match_value(v):
             s = str(int(f))
     except (ValueError, OverflowError):
         pass
+    return s.lower()
+
+
+def normalize_key_value(v):
+    """ปรับรหัสแปลง (PARCELDESC) ให้เทียบกันได้ โดยไม่แปลงผ่าน float
+    เพราะรหัสเป็นตัวเลข 15 หลัก ถ้าแปลงเป็นทศนิยมอาจเพี้ยนได้
+    ตัดช่องว่างหัวท้าย, ตัด .0 ท้าย (เช่น '960000008150791.0'), ค่าว่าง/NULL คืน '' """
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if s == "" or s.upper() == "NULL":
+        return ""
+    # ตัดเฉพาะทศนิยมที่เป็นศูนย์ล้วน ด้วยการตัดสตริง (ไม่ผ่าน float)
+    head, sep, tail = s.partition(".")
+    if sep and tail and set(tail) == {"0"} and head.lstrip("-").isdigit():
+        s = head
     return s.lower()
 
 
@@ -146,8 +164,10 @@ class EditBndNameDialog(QDialog):
 
 # --- 2. หน้าต่างสำหรับแก้ไข Attribute (แปลงที่คลิกเลือก + หมุดที่อยู่ตรงมุมเขตของแปลง) ---
 class EditAttributesDialog(QDialog):
+    MAX_PREVIEW_ITEMS = 50
+
     def __init__(self, point_layer, poly_layer, selected_point_ids, selected_poly_ids,
-                 parent=None, multi_mode=False):
+                 parent=None, multi_mode=False, point_preview=None):
         super(EditAttributesDialog, self).__init__(parent)
         self.setWindowTitle("แก้ไข Attribute และคำนวณ PATH ใหม่")
         self.setMinimumWidth(400)
@@ -171,12 +191,29 @@ class EditAttributesDialog(QDialog):
         main_layout = QVBoxLayout()
 
         # สรุปว่ากำลังจะแก้ไขอะไรบ้าง
-        info_text = f"จะแก้ไข: แปลง {len(selected_poly_ids)} แปลง | หมุด {len(selected_point_ids)} จุด"
+        info_text = (f"จะแก้ไข: แปลง {len(selected_poly_ids)} แปลง | "
+                     f"หมุด {len(selected_point_ids)} จุด (จับคู่ด้วย {PARCEL_KEY_FIELD})")
         if self.multi_mode:
             info_text += "\n(แก้ไขหลายแปลง: LANDNO ของแต่ละแปลงจะคงเดิม)"
         info_label = QLabel(info_text)
         info_label.setStyleSheet("color: #c0392b; font-size: 10pt;")
         main_layout.addWidget(info_label)
+
+        # รายการหมุดที่จะถูกแก้ ให้ตรวจสอบก่อนกดบันทึก (ปิดหน้าต่างนี้ = ยกเลิก)
+        if point_preview:
+            preview_group = QGroupBox(f"หมุดที่จะถูกแก้ไข ({len(point_preview)} จุด)")
+            preview_layout = QVBoxLayout()
+            preview_list = QListWidget()
+            preview_list.setStyleSheet("font-size: 9pt; font-weight: normal; background-color: white;")
+            preview_list.setMaximumHeight(120)
+            for line in point_preview[:self.MAX_PREVIEW_ITEMS]:
+                preview_list.addItem(QListWidgetItem(line))
+            if len(point_preview) > self.MAX_PREVIEW_ITEMS:
+                preview_list.addItem(QListWidgetItem(
+                    f"... และอีก {len(point_preview) - self.MAX_PREVIEW_ITEMS} จุด"))
+            preview_layout.addWidget(preview_list)
+            preview_group.setLayout(preview_layout)
+            main_layout.addWidget(preview_group)
 
         form_group = QGroupBox("ระบุข้อมูลใหม่")
         form_layout = QFormLayout()
@@ -720,7 +757,7 @@ class PathFilterTool(QDialog):
         self.parcel_tool = None
         self.highlight_rbs = []
         self.results_dlg = None
-        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.8")
+        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.9")
         self.setMinimumWidth(420)
 
         self.setStyleSheet("""
@@ -897,44 +934,99 @@ class PathFilterTool(QDialog):
             area_parts.append(format_area_value(feature.attribute(idx)) if idx != -1 else "-")
         area = "-".join(area_parts)
 
-        return (f"LANDNO: {landno} | PARCELNO: {parcel} | SURVEYNO: {survey} | "
+        desc = (f"LANDNO: {landno} | PARCELNO: {parcel} | SURVEYNO: {survey} | "
                 f"AREA: {area} | ID: {feature.id()}")
+
+        # แสดงรหัสแปลงที่ใช้จับคู่หมุดด้วย จะได้ตรวจสอบได้ว่าเลือกแปลงถูกตัว
+        idx_key = poly_layer.fields().indexOf(PARCEL_KEY_FIELD)
+        if idx_key != -1:
+            desc += f" | {PARCEL_KEY_FIELD}: {normalize_key_value(feature.attribute(idx_key)) or '-'}"
+        return desc
 
     def clear_highlight(self):
         for rb in self.highlight_rbs:
             self.iface.mapCanvas().scene().removeItem(rb)
         self.highlight_rbs = []
 
-    def find_points_on_vertices(self, p_layer, poly_layer, poly_features, tol=VERTEX_TOLERANCE):
-        """หาหมุดของแปลงที่เลือก โดยใช้ 2 เงื่อนไขร่วมกัน (ค้นเฉพาะหมุดที่ผ่าน Filter อยู่):
-        1) ค่าคอลัมน์ระบุงาน (เช่น FILE_NAME) ของหมุดต้องตรงกับของแปลง
-        2) ตำแหน่งหมุดต้องตรงกับมุมเขต (Vertex) ของแปลง คลาดเคลื่อนไม่เกิน tol หน่วยแผนที่"""
-        # แปลงขอบเขตแปลงให้อยู่ใน CRS ของ Layer หมุด (กันกรณี CRS ไม่ตรงกัน)
+    def find_points_by_parcel_key(self, p_layer, poly_layer, poly_features):
+        """หาหมุดของแปลงที่เลือก โดยยึดรหัสแปลง (PARCELDESC) ของ POLYGON เป็นหลัก
+        หมุดจะถูกเลือกมาแก้ไขก็ต่อเมื่อรหัสแปลงตรงกับแปลงที่คลิกเลือกเท่านั้น
+        ไม่ใช้ตำแหน่ง Vertex ตัดสิน เพราะแปลงที่เชื่อมต่อกันมีหมุดซ้อนทับกันสนิทที่มุมเขตเดียวกัน
+        จึงแยกไม่ออกด้วยตำแหน่ง และเป็นเหตุให้หมุดของแปลงข้างเคียงโดนแก้ไปด้วย
+
+        คืนค่า (point_ids, per_parcel, status)
+          per_parcel : {fid ของแปลง -> [fid ของหมุดที่เป็นของแปลงนั้น]}
+          status     : 'ok' | 'no_field_poly' | 'no_field_point' | 'no_key'
+        """
+        poly_idx = poly_layer.fields().indexOf(PARCEL_KEY_FIELD)
+        pt_idx = p_layer.fields().indexOf(PARCEL_KEY_FIELD)
+        if poly_idx == -1:
+            return [], {}, "no_field_poly"
+        if pt_idx == -1:
+            return [], {}, "no_field_point"
+
+        # รวบรวมรหัสแปลงของทุกแปลงที่เลือก (รองรับ Shift+คลิกเลือกหลายแปลง)
+        key_to_poly = {}   # รหัสแปลงที่ normalize แล้ว -> fid ของแปลง
+        raw_keys = []      # ค่าดิบ ไว้ใช้ใน expression ตอนค้นแบบเร็ว
+        for pf in poly_features:
+            raw = pf.attribute(poly_idx)
+            key = normalize_key_value(raw)
+            if not key:
+                continue
+            key_to_poly[key] = pf.id()
+            raw_keys.append(str(raw).strip())
+        if not key_to_poly:
+            return [], {}, "no_key"
+
+        per_parcel = {fid: [] for fid in key_to_poly.values()}
+
+        def collect(features):
+            """เก็บหมุดที่รหัสแปลงตรงกับแปลงที่เลือก คืนค่าว่าเจอหรือไม่"""
+            found = False
+            for f in features:
+                poly_fid = key_to_poly.get(normalize_key_value(f.attribute(pt_idx)))
+                if poly_fid is not None:
+                    per_parcel[poly_fid].append(f.id())
+                    found = True
+            return found
+
+        # ค้นแบบเร็ว: ส่งเงื่อนไขให้ผู้ให้บริการข้อมูลกรองให้ (เร็วแม้ Layer ขนาดใหญ่)
+        # และยังเคารพ Filter (setSubsetString) ที่ผู้ใช้ตั้งไว้เหมือนเดิม
+        in_list = ", ".join("'%s'" % escape_sql(k) for k in raw_keys)
+        expr = '"%s" IN (%s)' % (PARCEL_KEY_FIELD, in_list)
+        try:
+            request = QgsFeatureRequest().setFilterExpression(expr).setSubsetOfAttributes([pt_idx])
+            matched = collect(p_layer.getFeatures(request))
+        except Exception:
+            matched = False
+
+        # ค้นสำรอง: ถ้าไม่เจอเลย อาจเพราะสอง Layer เก็บชนิดข้อมูลไม่ตรงกัน
+        # (เช่นฝั่งหนึ่งเป็นตัวเลข '...791.0') จึงวนเทียบด้วยค่าที่ normalize แล้ว
+        if not matched:
+            for fids in per_parcel.values():
+                del fids[:]
+            collect(p_layer.getFeatures(QgsFeatureRequest().setSubsetOfAttributes([pt_idx])))
+
+        point_ids = sorted({fid for fids in per_parcel.values() for fid in fids})
+        return point_ids, per_parcel, "ok"
+
+    def count_points_off_vertices(self, p_layer, poly_layer, per_parcel, poly_features,
+                                  tol=VERTEX_TOLERANCE):
+        """ตรวจสอบเสริม (เตือนอย่างเดียว ไม่กรองหมุดออก): นับหมุดที่รหัสแปลงตรงกับแปลง
+        แต่ตำแหน่งไม่ได้อยู่บนมุมเขตของแปลงนั้น ซึ่งมักแปลว่าข้อมูลผิดปกติ"""
         transform = None
         if poly_layer.crs() != p_layer.crs():
             try:
                 transform = QgsCoordinateTransform(poly_layer.crs(), p_layer.crs(), QgsProject.instance())
             except Exception:
-                transform = None
-
-        # จับคู่ index คอลัมน์ระบุงานที่มีอยู่จริงครบทั้งสอง Layer
-        match_pairs = []
-        for name in ATTR_MATCH_FIELDS:
-            poly_idx = poly_layer.fields().indexOf(name)
-            pt_idx = p_layer.fields().indexOf(name)
-            if poly_idx != -1 and pt_idx != -1:
-                match_pairs.append((poly_idx, pt_idx))
-        if not match_pairs:
-            self.iface.messageBar().pushMessage(
-                "แจ้งเตือน",
-                f"ไม่พบคอลัมน์ {'/'.join(ATTR_MATCH_FIELDS)} ครบทั้งสอง Layer จะจับคู่หมุดจากตำแหน่ง Vertex เพียงอย่างเดียว",
-                level=1)
+                return 0
 
         tol2 = tol * tol
-        point_ids = []
-        seen = set()
-        fallback_used = False
+        off_count = 0
         for pf in poly_features:
+            fids = per_parcel.get(pf.id())
+            if not fids:
+                continue
             geom = QgsGeometry(pf.geometry())
             if geom.isEmpty():
                 continue
@@ -944,61 +1036,29 @@ class PathFilterTool(QDialog):
                 except Exception:
                     continue
 
-            # ค่าประจำแปลงนี้ (เช่น FILE_NAME) ไว้เทียบกับหมุดแต่ละตัว
-            expected = []
-            for poly_idx, pt_idx in match_pairs:
-                val = normalize_match_value(pf.attribute(poly_idx))
-                if val:
-                    expected.append((pt_idx, val))
-
-            bbox = geom.boundingBox()
-            bbox.grow(tol)
-            attr_subset = [pt_idx for pt_idx, _ in expected]
-            request = QgsFeatureRequest().setFilterRect(bbox).setSubsetOfAttributes(attr_subset)
-
-            vertex_hits = []   # หมุดที่ตำแหน่งตรง Vertex ของแปลงนี้
-            attr_hits = []     # หมุดที่ตรงทั้งตำแหน่งและค่าคอลัมน์ระบุงาน (FILE_NAME)
+            request = QgsFeatureRequest().setFilterFids(fids).setSubsetOfAttributes([])
             for f in p_layer.getFeatures(request):
-                if f.id() in seen:
-                    continue
                 g = f.geometry()
                 if not g:
                     continue
-
-                # ตำแหน่งต้องตรงกับ Vertex ของแปลงก่อน
                 try:
                     p = g.asPoint()
                 except Exception:
                     p = g.centroid().asPoint()
                 _, _, _, _, sqr_dist = geom.closestVertex(p)
                 if not (0 <= sqr_dist <= tol2):
-                    continue
-                vertex_hits.append(f.id())
+                    off_count += 1
+        return off_count
 
-                # แล้วจึงเช็คค่าคอลัมน์ระบุงานว่าตรงกับแปลงหรือไม่ (กันหมุดแปลงอื่นที่อยู่ชิดกัน)
-                if expected and all(normalize_match_value(f.attribute(pt_idx)) == exp_val
-                                    for pt_idx, exp_val in expected):
-                    attr_hits.append(f.id())
-
-            # ใช้ชุดที่ผ่านทั้ง 2 เงื่อนไขก่อน แต่ถ้าค่าคอลัมน์ไม่ตรงเลยสักหมุด
-            # ให้ถอยไปใช้ตำแหน่ง Vertex อย่างเดียว (กันกรณีข้อมูล FILE_NAME สอง Layer เก็บไม่ตรงกัน)
-            if expected and attr_hits:
-                chosen_ids = attr_hits
-            else:
-                chosen_ids = vertex_hits
-                if expected and vertex_hits:
-                    fallback_used = True
-
-            for fid in chosen_ids:
-                seen.add(fid)
-                point_ids.append(fid)
-
-        if fallback_used:
-            self.iface.messageBar().pushMessage(
-                "แจ้งเตือน",
-                "ค่า FILE_NAME ของหมุดไม่ตรงกับของแปลงที่เลือก จึงจับคู่จากตำแหน่ง Vertex แทน (ควรตรวจสอบข้อมูล FILE_NAME ของทั้งสอง Layer)",
-                level=1)
-        return point_ids
+    def describe_point(self, p_layer, feature):
+        """สร้างข้อความอธิบายหมุด 1 จุด สำหรับรายการตรวจสอบก่อนบันทึก"""
+        parts = []
+        for name in ("BND_ORDNO", "BND_NAME", "LANDNO", PARCEL_KEY_FIELD):
+            idx = p_layer.fields().indexOf(name)
+            val = feature.attribute(idx) if idx != -1 else None
+            val = "" if val is None else str(val).strip()
+            parts.append(f"{name}: {val if val and val != 'NULL' else '-'}")
+        return " | ".join(parts) + f" | ID: {feature.id()}"
 
     def start_edit_for_polygons(self, poly_features):
         poly_layer = self.poly_combo.currentLayer()
@@ -1018,13 +1078,46 @@ class PathFilterTool(QDialog):
             rb.setWidth(3)
             self.highlight_rbs.append(rb)
 
-        # หาหมุดที่ตำแหน่งตรงกับมุมเขต (Vertex) ของแปลงที่เลือกเท่านั้น
+        # หาหมุดของแปลงที่เลือกจริงๆ โดยยึดรหัสแปลง (PARCELDESC) ของ POLYGON เป็นหลัก
         point_ids = []
+        point_preview = []
         if p_layer:
-            point_ids = self.find_points_on_vertices(p_layer, poly_layer, poly_features)
-            if not point_ids:
-                self.iface.messageBar().pushMessage(
-                    "แจ้งเตือน", "ไม่พบหมุดที่ตำแหน่งตรงกับมุมเขตของแปลงที่เลือก จะแก้ไขเฉพาะแปลงเท่านั้น", level=1)
+            point_ids, per_parcel, status = self.find_points_by_parcel_key(
+                p_layer, poly_layer, poly_features)
+
+            # จับคู่ไม่ได้ = ไม่แตะหมุดเลย (ปลอดภัยกว่าการเดาจากตำแหน่ง ซึ่งจะได้หมุดแปลงข้างเคียงมา)
+            if status == "no_field_poly":
+                QMessageBox.warning(self, "จับคู่หมุดไม่ได้",
+                                    f"Layer แปลง '{poly_layer.name()}' ไม่มีคอลัมน์ '{PARCEL_KEY_FIELD}'\n"
+                                    f"จึงระบุไม่ได้ว่าหมุดใดเป็นของแปลงนี้ จะแก้ไขเฉพาะแปลงเท่านั้น")
+            elif status == "no_field_point":
+                QMessageBox.warning(self, "จับคู่หมุดไม่ได้",
+                                    f"Layer หมุด '{p_layer.name()}' ไม่มีคอลัมน์ '{PARCEL_KEY_FIELD}'\n"
+                                    f"จึงระบุไม่ได้ว่าหมุดใดเป็นของแปลงนี้ จะแก้ไขเฉพาะแปลงเท่านั้น")
+            elif status == "no_key":
+                QMessageBox.warning(self, "จับคู่หมุดไม่ได้",
+                                    f"แปลงที่เลือกไม่มีค่า '{PARCEL_KEY_FIELD}' จะแก้ไขเฉพาะแปลงเท่านั้น")
+            else:
+                # แจ้งแปลงที่หาหมุดไม่เจอเลย เผื่อข้อมูลหมุดหายหรือติด Filter อยู่
+                empty = [pf for pf in poly_features if not per_parcel.get(pf.id())]
+                if empty:
+                    self.iface.messageBar().pushMessage(
+                        "แจ้งเตือน",
+                        f"ไม่พบหมุดที่มี {PARCEL_KEY_FIELD} ตรงกับแปลง {len(empty)} แปลง "
+                        f"(ถ้ามีการ Filter อยู่ จะหาเจอเฉพาะหมุดที่ผ่าน Filter)", level=1)
+
+                # ตรวจสอบเสริม: หมุดที่รหัสตรงแต่ตำแหน่งไม่ได้อยู่บนมุมเขต = ข้อมูลน่าสงสัย
+                off_count = self.count_points_off_vertices(p_layer, poly_layer, per_parcel, poly_features)
+                if off_count:
+                    self.iface.messageBar().pushMessage(
+                        "ตรวจสอบข้อมูล",
+                        f"มีหมุด {off_count} จุดที่ {PARCEL_KEY_FIELD} ตรงกับแปลง "
+                        f"แต่ตำแหน่งไม่ได้อยู่บนมุมเขตของแปลง (ยังแก้ไขให้ตามปกติ)", level=1)
+
+                request = QgsFeatureRequest().setFilterFids(point_ids)
+                preview_map = {f.id(): self.describe_point(p_layer, f)
+                               for f in p_layer.getFeatures(request)}
+                point_preview = [preview_map[fid] for fid in point_ids if fid in preview_map]
 
         # เลือก Feature บนแผนที่ให้เห็นชัดๆ ว่าจะแก้ตัวไหนบ้าง
         poly_ids = [pf.id() for pf in poly_features]
@@ -1033,7 +1126,7 @@ class PathFilterTool(QDialog):
             p_layer.selectByIds(point_ids)
 
         dlg = EditAttributesDialog(p_layer, poly_layer, point_ids, poly_ids,
-                                   self, multi_mode=multi_mode)
+                                   self, multi_mode=multi_mode, point_preview=point_preview)
         dlg.exec_()
 
         # เคลียร์ไฮไลท์และ selection หลังปิดหน้าต่างแก้ไข
