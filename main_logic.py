@@ -38,6 +38,11 @@ VERTEX_TOLERANCE = 0.10
 # (ห้ามใช้ตำแหน่ง Vertex ตัดสิน เพราะแปลงที่เชื่อมต่อกันมีหมุดซ้อนทับกันสนิทที่มุมเขตเดียวกัน)
 PARCEL_KEY_FIELD = "PARCELDESC"
 
+# ระยะห่างสูงสุด (หน่วยแผนที่ เช่น เมตร) ที่ยอมรับว่าหมุด "อยู่ในบริเวณ" ของแปลงที่คลิกเลือก
+# ใช้เป็นเงื่อนไขที่สองต่อจากรหัสแปลง กันกรณีหมุดมีรหัสแปลงตรงกันแต่ตำแหน่งอยู่ผิดที่
+# (เช่น ข้อมูลหมุดหลุดไปคนละบริเวณ หรือมีรหัสแปลงซ้ำกันข้ามพื้นที่)
+PARCEL_AREA_TOLERANCE = 10.0
+
 # คอลัมน์และค่าที่ใช้ทำเครื่องหมายว่า "แปลงนี้เป็นแปลงที่ถูกต้อง"
 # (ติ๊กในหน้าต่างผลการค้นหา เพื่อคัดแปลงที่ต้องการออกจากรายการที่ซ้ำกัน)
 CORRECT_FLAG_FIELD = "OWNERNAME"
@@ -954,16 +959,20 @@ class PathFilterTool(QDialog):
         ไม่ใช้ตำแหน่ง Vertex ตัดสิน เพราะแปลงที่เชื่อมต่อกันมีหมุดซ้อนทับกันสนิทที่มุมเขตเดียวกัน
         จึงแยกไม่ออกด้วยตำแหน่ง และเป็นเหตุให้หมุดของแปลงข้างเคียงโดนแก้ไปด้วย
 
-        คืนค่า (point_ids, per_parcel, status)
+        และหมุดนั้นต้องอยู่ในบริเวณของแปลงที่คลิกเลือกด้วย (ไม่เกิน PARCEL_AREA_TOLERANCE)
+        กันกรณีหมุดรหัสตรงกันแต่ตำแหน่งอยู่ผิดที่ ไม่ใช่แปลงบริเวณที่คลิก
+
+        คืนค่า (point_ids, per_parcel, status, off_area)
           per_parcel : {fid ของแปลง -> [fid ของหมุดที่เป็นของแปลงนั้น]}
           status     : 'ok' | 'no_field_poly' | 'no_field_point' | 'no_key'
+          off_area   : {fid ของแปลง -> [fid ของหมุดที่รหัสตรงแต่อยู่นอกบริเวณ]}
         """
         poly_idx = poly_layer.fields().indexOf(PARCEL_KEY_FIELD)
         pt_idx = p_layer.fields().indexOf(PARCEL_KEY_FIELD)
         if poly_idx == -1:
-            return [], {}, "no_field_poly"
+            return [], {}, "no_field_poly", {}
         if pt_idx == -1:
-            return [], {}, "no_field_point"
+            return [], {}, "no_field_point", {}
 
         # รวบรวมรหัสแปลงของทุกแปลงที่เลือก (รองรับ Shift+คลิกเลือกหลายแปลง)
         key_to_poly = {}   # รหัสแปลงที่ normalize แล้ว -> fid ของแปลง
@@ -976,7 +985,7 @@ class PathFilterTool(QDialog):
             key_to_poly[key] = pf.id()
             raw_keys.append(str(raw).strip())
         if not key_to_poly:
-            return [], {}, "no_key"
+            return [], {}, "no_key", {}
 
         per_parcel = {fid: [] for fid in key_to_poly.values()}
 
@@ -1007,8 +1016,56 @@ class PathFilterTool(QDialog):
                 del fids[:]
             collect(p_layer.getFeatures(QgsFeatureRequest().setSubsetOfAttributes([pt_idx])))
 
+        # เงื่อนไขที่สอง: หมุดต้องอยู่ในบริเวณของแปลงที่คลิกเลือกด้วย
+        off_area = self.reject_points_outside_parcel(p_layer, poly_layer, per_parcel, poly_features)
+
         point_ids = sorted({fid for fids in per_parcel.values() for fid in fids})
-        return point_ids, per_parcel, "ok"
+        return point_ids, per_parcel, "ok", off_area
+
+    def reject_points_outside_parcel(self, p_layer, poly_layer, per_parcel, poly_features,
+                                     tol=PARCEL_AREA_TOLERANCE):
+        """ตัดหมุดที่รหัสแปลงตรงกัน แต่ตำแหน่งไม่ได้อยู่ในบริเวณของแปลงที่คลิกเลือกออก
+        วัดจากระยะห่างถึงขอบเขตแปลง (อยู่ในแปลงหรือบนขอบ = 0)
+        แก้ไข per_parcel ในตัว และคืน {fid ของแปลง -> [fid ของหมุดที่ถูกตัดออก]}"""
+        transform = None
+        if poly_layer.crs() != p_layer.crs():
+            try:
+                transform = QgsCoordinateTransform(poly_layer.crs(), p_layer.crs(), QgsProject.instance())
+            except Exception:
+                self.iface.messageBar().pushMessage(
+                    "แจ้งเตือน",
+                    "แปลงพิกัดระหว่าง Layer แปลงกับ Layer หมุดไม่ได้ จึงข้ามการตรวจสอบตำแหน่ง",
+                    level=1)
+                return {}
+
+        off_area = {}
+        for pf in poly_features:
+            fids = per_parcel.get(pf.id())
+            if not fids:
+                continue
+            geom = QgsGeometry(pf.geometry())
+            if geom.isEmpty():
+                continue
+            if transform:
+                try:
+                    geom.transform(transform)
+                except Exception:
+                    continue
+
+            # หมุดที่อยู่ในบริเวณแปลง (ระยะห่างจากขอบเขตแปลงไม่เกิน tol)
+            near = set()
+            request = QgsFeatureRequest().setFilterFids(fids).setSubsetOfAttributes([])
+            for f in p_layer.getFeatures(request):
+                g = f.geometry()
+                if g and not g.isEmpty() and geom.distance(g) <= tol:
+                    near.add(f.id())
+
+            keep = [fid for fid in fids if fid in near]
+            rejected = [fid for fid in fids if fid not in near]
+            per_parcel[pf.id()] = keep
+            if rejected:
+                off_area[pf.id()] = rejected
+        return off_area
 
     def count_points_off_vertices(self, p_layer, poly_layer, per_parcel, poly_features,
                                   tol=VERTEX_TOLERANCE):
@@ -1082,7 +1139,7 @@ class PathFilterTool(QDialog):
         point_ids = []
         point_preview = []
         if p_layer:
-            point_ids, per_parcel, status = self.find_points_by_parcel_key(
+            point_ids, per_parcel, status, off_area = self.find_points_by_parcel_key(
                 p_layer, poly_layer, poly_features)
 
             # จับคู่ไม่ได้ = ไม่แตะหมุดเลย (ปลอดภัยกว่าการเดาจากตำแหน่ง ซึ่งจะได้หมุดแปลงข้างเคียงมา)
@@ -1098,12 +1155,33 @@ class PathFilterTool(QDialog):
                 QMessageBox.warning(self, "จับคู่หมุดไม่ได้",
                                     f"แปลงที่เลือกไม่มีค่า '{PARCEL_KEY_FIELD}' จะแก้ไขเฉพาะแปลงเท่านั้น")
             else:
+                # หมุดที่รหัสแปลงตรง แต่ตำแหน่งอยู่นอกบริเวณของแปลงที่คลิก = น่าจะเป็นข้อมูลผิดตำแหน่ง
+                # ไม่แก้ไขให้โดยอัตโนมัติ ต้องให้ผู้ใช้ยืนยันก่อน
+                off_count = sum(len(v) for v in off_area.values())
+                if off_count:
+                    answer = QMessageBox.question(
+                        self, "พบหมุดอยู่นอกบริเวณของแปลง",
+                        f"พบหมุด {off_count} จุดที่ {PARCEL_KEY_FIELD} ตรงกับแปลงที่เลือก\n"
+                        f"แต่ตำแหน่งอยู่ห่างจากแปลงเกิน {PARCEL_AREA_TOLERANCE:g} เมตร\n"
+                        f"(น่าจะเป็นหมุดที่อยู่ผิดตำแหน่ง ไม่ใช่หมุดของแปลงบริเวณที่คลิก)\n\n"
+                        f"ต้องการรวมหมุดเหล่านี้เข้าไปแก้ไขด้วยหรือไม่?\n"
+                        f"แนะนำให้เลือก No เพื่อแก้เฉพาะหมุดในบริเวณของแปลงที่คลิก",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                    if answer == QMessageBox.Yes:
+                        for poly_fid, fids in off_area.items():
+                            per_parcel[poly_fid].extend(fids)
+                        point_ids = sorted({fid for fids in per_parcel.values() for fid in fids})
+                    else:
+                        self.iface.messageBar().pushMessage(
+                            "ข้ามหมุดนอกบริเวณ",
+                            f"ไม่แก้ไขหมุด {off_count} จุดที่อยู่นอกบริเวณของแปลงที่เลือก", level=0)
+
                 # แจ้งแปลงที่หาหมุดไม่เจอเลย เผื่อข้อมูลหมุดหายหรือติด Filter อยู่
                 empty = [pf for pf in poly_features if not per_parcel.get(pf.id())]
                 if empty:
                     self.iface.messageBar().pushMessage(
                         "แจ้งเตือน",
-                        f"ไม่พบหมุดที่มี {PARCEL_KEY_FIELD} ตรงกับแปลง {len(empty)} แปลง "
+                        f"ไม่พบหมุดที่มี {PARCEL_KEY_FIELD} ตรงกับแปลงและอยู่ในบริเวณแปลง {len(empty)} แปลง "
                         f"(ถ้ามีการ Filter อยู่ จะหาเจอเฉพาะหมุดที่ผ่าน Filter)", level=1)
 
                 # ตรวจสอบเสริม: หมุดที่รหัสตรงแต่ตำแหน่งไม่ได้อยู่บนมุมเขต = ข้อมูลน่าสงสัย
