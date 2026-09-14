@@ -1,0 +1,11 @@
+# เอกสารฝั่งพัฒนา เก็บไว้ในเครื่องเท่านั้น ไม่ขึ้น GitHub และไม่ติดไปกับปลั๊กอินที่ผู้ใช้ดาวน์โหลด
+CLAUDE.md
+MEMORY.md
+CONFIG.md
+PROJECT.md
+SKILL.md
+RULES.md
+
+# ไฟล์ที่เกิดจากการตรวจ syntax
+__pycache__/
+*.pyc

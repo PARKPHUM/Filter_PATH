@@ -634,6 +634,7 @@ class FilterResultsDialog(QDialog):
             item.setData(Qt.UserRole, (layer, fid))
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked if self.is_flagged(layer, fid) else Qt.Unchecked)
+            self.apply_check_style(item)
             self.list_widget.addItem(item)
         if len(results) > self.MAX_ITEMS:
             note = QListWidgetItem(
@@ -675,11 +676,24 @@ class FilterResultsDialog(QDialog):
             return False
         return normalize_match_value(f.attribute(idx)) == normalize_match_value(CORRECT_FLAG_VALUE)
 
+    def apply_check_style(self, item):
+        """รายการที่ติ๊กแล้ว = ตัวหนา เพื่อให้เห็นชัดว่าตรวจแปลงไหนไปแล้วบ้าง
+        (setFont ทำให้ itemChanged ยิงซ้ำ จึงต้อง block signal ไว้ แล้วคืนสถานะเดิม)"""
+        bold = item.checkState() == Qt.Checked
+        font = item.font()
+        if font.bold() == bold:
+            return
+        font.setBold(bold)
+        prev = self.list_widget.blockSignals(True)
+        item.setFont(font)
+        self.list_widget.blockSignals(prev)
+
     def set_item_check_silently(self, item, state):
         """ย้อนสถานะติ๊กกลับโดยไม่ให้ signal ยิงซ้ำ"""
         self.list_widget.blockSignals(True)
         item.setCheckState(state)
         self.list_widget.blockSignals(False)
+        self.apply_check_style(item)
 
     def on_item_checked(self, item):
         data = item.data(Qt.UserRole)
@@ -707,6 +721,7 @@ class FilterResultsDialog(QDialog):
         layer.changeAttributeValue(fid, idx, new_val)
 
         if layer.commitChanges():
+            self.apply_check_style(item)
             self.iface.messageBar().pushMessage(
                 "บันทึกแล้ว",
                 f"{'ทำเครื่องหมาย' if checked else 'ยกเลิกเครื่องหมาย'}แปลง ID {fid} "
@@ -762,7 +777,10 @@ class PathFilterTool(QDialog):
         self.parcel_tool = None
         self.highlight_rbs = []
         self.results_dlg = None
-        self.setWindowTitle("PATH Filter & Edit Attribute UTM Version 3.9")
+        # อ่านเลขเวอร์ชันจาก metadata.txt กันชื่อหน้าต่างค้างเวอร์ชันเก่าเวลา bump version
+        ver = self.get_local_version()
+        self.setWindowTitle(f"PATH Filter & Edit Attribute UTM Version {ver}" if ver
+                            else "PATH Filter & Edit Attribute UTM")
         self.setMinimumWidth(420)
 
         self.setStyleSheet("""
