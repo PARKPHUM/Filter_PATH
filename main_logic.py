@@ -3,16 +3,17 @@ import urllib.request
 import zipfile
 import shutil
 import tempfile
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer, QUrl
 from qgis.PyQt.QtGui import QIcon, QCursor, QColor
-from qgis.PyQt.QtWidgets import (QAction, QDialog, QVBoxLayout, QLabel,
+from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
+from qgis.PyQt.QtWidgets import (QAction, QApplication, QDialog, QVBoxLayout, QLabel,
                                  QLineEdit, QPushButton, QMessageBox, QFormLayout, QGroupBox,
                                  QMenu, QHBoxLayout, QListWidget, QListWidgetItem)
 from qgis.gui import (QgsMapLayerComboBox, QgsMapToolEmitPoint, QgsRubberBand,
                       QgsVertexMarker)
 from qgis.core import (QgsMapLayerProxyModel, QgsRectangle, QgsFeatureRequest,
                        QgsGeometry, QgsCoordinateTransform, QgsProject, QgsWkbTypes,
-                       QgsPointXY)
+                       QgsPointXY, QgsNetworkAccessManager, QgsMessageLog, Qgis)
 
 # =====================================================================
 # ตั้งค่าลิงก์ GitHub Repository ของคุณที่นี่ (ต้องเป็นลิงก์ดาวน์โหลดแบบ .zip)
@@ -60,6 +61,39 @@ def parse_version(text):
         return tuple(int(x) for x in str(text).strip().split("."))
     except (ValueError, AttributeError):
         return None
+
+
+def read_metadata_version(text):
+    """ดึงค่า version= จากเนื้อหาไฟล์ metadata.txt ไม่พบคืน None"""
+    for line in str(text).splitlines():
+        if line.strip().lower().startswith("version="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def is_newer_version(remote_ver, local_ver):
+    """True เมื่อเวอร์ชันบน GitHub ใหม่กว่าในเครื่อง
+    อ่านเลขฝั่ง GitHub ไม่ได้ = False (ไม่เตือนมั่ว) / อ่านเลขในเครื่องไม่ได้ = True (ให้อัปเดตทับ)"""
+    remote_t = parse_version(remote_ver)
+    if remote_t is None:
+        return False
+    local_t = parse_version(local_ver)
+    return local_t is None or remote_t > local_t
+
+
+def plugin_package_name():
+    """ชื่อแพ็กเกจที่ QGIS ใช้อ้างถึงปลั๊กอินนี้ (= ชื่อโฟลเดอร์ใน plugins)"""
+    return __name__.split(".")[0]
+
+
+def reload_this_plugin():
+    """โหลดโค้ดชุดที่เพิ่งคัดลอกทับเข้ามาใหม่โดยไม่ต้องปิด-เปิด QGIS
+    เรียก unload() ของตัวเก่า แล้ว import และ initGui() ตัวใหม่ คืน True เมื่อสำเร็จ"""
+    from qgis import utils
+    name = plugin_package_name()
+    if name not in utils.active_plugins:
+        return False
+    return bool(utils.reloadPlugin(name))
 
 
 def format_area_value(v):
@@ -777,6 +811,7 @@ class PathFilterTool(QDialog):
         self.parcel_tool = None
         self.highlight_rbs = []
         self.results_dlg = None
+        self.update_reply = None  # คำขอเช็คเวอร์ชันอัตโนมัติที่ยังรอผลอยู่
         # อ่านเลขเวอร์ชันจาก metadata.txt กันชื่อหน้าต่างค้างเวอร์ชันเก่าเวลา bump version
         ver = self.get_local_version()
         self.setWindowTitle(f"PATH Filter & Edit Attribute UTM Version {ver}" if ver
@@ -1245,6 +1280,8 @@ class PathFilterTool(QDialog):
 
     # ---------- ปิดหน้าต่าง: เก็บกวาดเครื่องมือและไฮไลท์ ----------
     def closeEvent(self, event):
+        if self.update_reply:
+            self.update_reply.abort()
         self.clear_highlight()
         if self.results_dlg:
             self.results_dlg.close()
@@ -1258,28 +1295,65 @@ class PathFilterTool(QDialog):
 
     # ---------- อัปเดตปลั๊กอิน ----------
     def get_local_version(self):
-        """อ่านเลขเวอร์ชันจาก metadata.txt ในเครื่อง"""
+        """อ่านเลขเวอร์ชันจาก metadata.txt ในเครื่อง (อ่านจากไฟล์ทุกครั้ง จึงเห็นเลขใหม่ทันทีหลังอัปเดต)"""
         try:
             meta_path = os.path.join(os.path.dirname(__file__), "metadata.txt")
             with open(meta_path, "r", encoding="utf-8-sig") as fh:
-                for line in fh:
-                    if line.strip().lower().startswith("version="):
-                        return line.split("=", 1)[1].strip()
+                return read_metadata_version(fh.read())
         except Exception:
-            pass
-        return None
+            return None
 
     def get_remote_version(self):
         """อ่านเลขเวอร์ชันล่าสุดจาก metadata.txt บน GitHub"""
         try:
             with urllib.request.urlopen(GITHUB_METADATA_URL, timeout=15) as resp:
-                remote_text = resp.read().decode("utf-8-sig", errors="ignore")
-            for line in remote_text.splitlines():
-                if line.strip().lower().startswith("version="):
-                    return line.split("=", 1)[1].strip()
+                return read_metadata_version(resp.read().decode("utf-8-sig", errors="ignore"))
         except Exception:
-            pass
-        return None
+            return None
+
+    def check_update_on_open(self):
+        """เช็คเวอร์ชันบน GitHub ทุกครั้งที่เปิดปลั๊กอิน แบบไม่บล็อกหน้าจอ
+        ใช้ QgsNetworkAccessManager เพื่อให้ผ่าน proxy ที่ตั้งไว้ใน QGIS ได้
+        เช็คไม่ได้ (ไม่มีเน็ต ฯลฯ) ให้เงียบไว้ ไม่รบกวนงาน — ปุ่มอัปเดตยังกดเองได้"""
+        if self.update_reply:
+            return
+        req = QNetworkRequest(QUrl(GITHUB_METADATA_URL))
+        # ห้ามอ่านจาก cache กันได้เลขเวอร์ชันเก่าค้าง
+        req.setAttribute(QNetworkRequest.CacheLoadControlAttribute, QNetworkRequest.AlwaysNetwork)
+        self.update_reply = QgsNetworkAccessManager.instance().get(req)
+        self.update_reply.finished.connect(self.on_update_check_finished)
+
+    def on_update_check_finished(self):
+        reply, self.update_reply = self.update_reply, None
+        if reply is None:
+            return
+        try:
+            if reply.error() != QNetworkReply.NoError:
+                QgsMessageLog.logMessage(f"เช็คเวอร์ชันใหม่ไม่ได้: {reply.errorString()}",
+                                         "Path Filter", Qgis.Info)
+                return
+            remote_ver = read_metadata_version(
+                bytes(reply.readAll()).decode("utf-8-sig", errors="ignore"))
+        finally:
+            reply.deleteLater()
+
+        # ผู้ใช้ปิดหน้าต่างไปก่อนผลกลับมา -> ไว้เตือนตอนเปิดครั้งหน้า
+        local_ver = self.get_local_version()
+        if self.isVisible() and is_newer_version(remote_ver, local_ver):
+            self.prompt_update(local_ver, remote_ver)
+
+    def prompt_update(self, local_ver, remote_ver):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("พบเวอร์ชันใหม่")
+        msg.setIcon(QMessageBox.Information)
+        msg.setText(f"มีปลั๊กอินเวอร์ชันใหม่แล้ว: {remote_ver}\n"
+                    f"เวอร์ชันปัจจุบันของคุณ: {local_ver if local_ver else 'ไม่ทราบ'}\n\n"
+                    "กรุณาอัปเดตก่อนใช้งาน")
+        btn_update = msg.addButton("อัปเดตเลย", QMessageBox.AcceptRole)
+        msg.addButton("ไว้ภายหลัง", QMessageBox.RejectRole)
+        msg.exec_()
+        if msg.clickedButton() == btn_update:
+            self.download_and_install_update()
 
     def update_plugin(self):
         if "USERNAME" in GITHUB_UPDATE_URL:
@@ -1288,11 +1362,9 @@ class PathFilterTool(QDialog):
 
         local_ver = self.get_local_version()
         remote_ver = self.get_remote_version()
-        local_t = parse_version(local_ver)
-        remote_t = parse_version(remote_ver)
 
         # เช็คเวอร์ชันจาก GitHub ไม่ได้ (เน็ตมีปัญหา ฯลฯ) -> ถามว่าจะดาวน์โหลดทับเลยหรือไม่
-        if remote_t is None:
+        if parse_version(remote_ver) is None:
             reply = QMessageBox.question(self, "ตรวจสอบเวอร์ชันไม่ได้",
                 "ไม่สามารถตรวจสอบเวอร์ชันล่าสุดจาก GitHub ได้\n(อินเทอร์เน็ตหรือลิงก์อาจมีปัญหา)\n\nต้องการดาวน์โหลดอัปเดตทับไปเลยหรือไม่?",
                 QMessageBox.Yes | QMessageBox.No)
@@ -1300,27 +1372,18 @@ class PathFilterTool(QDialog):
                 self.download_and_install_update()
             return
 
-        # เป็นเวอร์ชันล่าสุดอยู่แล้ว
-        if local_t is not None and remote_t <= local_t:
+        if not is_newer_version(remote_ver, local_ver):
             QMessageBox.information(self, "เป็นเวอร์ชันล่าสุดแล้ว",
                 f"คุณใช้เวอร์ชันล่าสุดอยู่แล้ว (เวอร์ชัน {local_ver})")
             return
 
-        # พบเวอร์ชันใหม่กว่า -> มีปุ่มกดอัปเดตได้เลย
-        msg = QMessageBox(self)
-        msg.setWindowTitle("พบเวอร์ชันใหม่")
-        msg.setIcon(QMessageBox.Information)
-        msg.setText(f"พบเวอร์ชันใหม่: {remote_ver}\nเวอร์ชันปัจจุบันของคุณ: {local_ver if local_ver else 'ไม่ทราบ'}")
-        btn_update = msg.addButton("อัปเดตเลย", QMessageBox.AcceptRole)
-        msg.addButton("ไว้ภายหลัง", QMessageBox.RejectRole)
-        msg.exec_()
-        if msg.clickedButton() == btn_update:
-            self.download_and_install_update()
+        self.prompt_update(local_ver, remote_ver)
 
     def download_and_install_update(self):
+        temp_dir = tempfile.mkdtemp()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             plugin_dir = os.path.dirname(__file__)
-            temp_dir = tempfile.mkdtemp()
             zip_path = os.path.join(temp_dir, "update.zip")
 
             urllib.request.urlretrieve(GITHUB_UPDATE_URL, zip_path)
@@ -1330,23 +1393,46 @@ class PathFilterTool(QDialog):
 
             # ปกติการแตกไฟล์จาก GitHub จะมี Folder หุ้มไว้ 1 ชั้น
             extracted_folders = [os.path.join(temp_dir, d) for d in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, d))]
-            if extracted_folders:
-                source_dir = extracted_folders[0]
-                for item in os.listdir(source_dir):
-                    s = os.path.join(source_dir, item)
-                    d = os.path.join(plugin_dir, item)
-                    if os.path.isdir(s):
-                        if os.path.exists(d): shutil.rmtree(d)
-                        shutil.copytree(s, d)
-                    else:
-                        shutil.copy2(s, d)
-
-            shutil.rmtree(temp_dir)
-            QMessageBox.information(self, "อัปเดตสำเร็จ!",
-                "ทำการคัดลอกไฟล์เวอร์ชันล่าสุดเรียบร้อยแล้ว\n\n** กรุณาปิดโปรแกรม QGIS และเปิดใหม่อีกครั้ง **\nเพื่อให้โปรแกรมโหลดเวอร์ชันล่าสุดขึ้นมาทำงาน")
-
+            if not extracted_folders:
+                raise RuntimeError("ไม่พบไฟล์ปลั๊กอินในไฟล์ zip ที่ดาวน์โหลดมา")
+            source_dir = extracted_folders[0]
+            for item in os.listdir(source_dir):
+                s = os.path.join(source_dir, item)
+                d = os.path.join(plugin_dir, item)
+                if os.path.isdir(s):
+                    if os.path.exists(d): shutil.rmtree(d)
+                    shutil.copytree(s, d)
+                else:
+                    shutil.copy2(s, d)
         except Exception as e:
+            QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "อัปเดตล้มเหลว", f"เกิดข้อผิดพลาดในการดาวน์โหลดหรือเขียนไฟล์ทับ:\n{str(e)}")
+            return
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        QApplication.restoreOverrideCursor()
+
+        new_ver = self.get_local_version()
+        QMessageBox.information(self, "อัปเดตสำเร็จ!",
+            f"อัปเดตเป็นเวอร์ชัน {new_ver if new_ver else 'ล่าสุด'} เรียบร้อยแล้ว\n\n"
+            "หน้าต่างนี้จะปิดลง เมื่อเปิดปลั๊กอินอีกครั้งจะได้ใช้เวอร์ชันใหม่ทันที\n"
+            "(ไม่ต้องปิดโปรแกรม QGIS)")
+        # รอให้ slot ที่เรียกเข้ามา (ปุ่ม/ผลเช็คเวอร์ชัน) จบก่อน แล้วค่อยปิดหน้าต่างและโหลดโค้ดใหม่
+        QTimer.singleShot(0, self.reload_after_update)
+
+    def reload_after_update(self):
+        """ปิดหน้าต่างของโค้ดชุดเก่า แล้วให้ QGIS โหลดปลั๊กอินชุดใหม่ที่เพิ่งคัดลอกทับ
+        ปุ่มบน Toolbar จะผูกกับโค้ดชุดใหม่ เปิดครั้งถัดไปจึงได้เวอร์ชันใหม่ทันที"""
+        self.close()
+        try:
+            ok = reload_this_plugin()
+        except Exception as e:
+            QgsMessageLog.logMessage(f"โหลดปลั๊กอินเวอร์ชันใหม่ไม่สำเร็จ: {e}", "Path Filter", Qgis.Warning)
+            ok = False
+        if not ok:
+            QMessageBox.warning(self.iface.mainWindow(), "โหลดเวอร์ชันใหม่ไม่สำเร็จ",
+                "คัดลอกไฟล์เวอร์ชันใหม่เรียบร้อยแล้ว แต่โหลดขึ้นมาทำงานทันทีไม่ได้\n\n"
+                "** กรุณาปิดโปรแกรม QGIS และเปิดใหม่อีกครั้ง **")
 
 
 # --- 6. ส่วนการจัดการตัวปลั๊กอิน ---
@@ -1354,6 +1440,7 @@ class PathFilterPlugin:
     def __init__(self, iface):
         self.iface = iface
         self.action = None
+        self.dlg = None
 
     def initGui(self):
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.png')
@@ -1366,9 +1453,19 @@ class PathFilterPlugin:
         self.iface.addPluginToVectorMenu("Land Dept Tools", self.action)
 
     def unload(self):
+        # ปิดหน้าต่างของโค้ดชุดนี้ด้วย ไม่ให้ค้างอยู่หลังโหลดเวอร์ชันใหม่หรือปิดปลั๊กอินใน Plugin Manager
+        if self.dlg:
+            self.dlg.close()
+            self.dlg = None
         self.iface.removePluginVectorMenu("Land Dept Tools", self.action)
         self.iface.removeToolBarIcon(self.action)
 
     def run(self):
+        # หน้าต่างเปิดค้างอยู่แล้ว -> ดึงขึ้นมาแทนการเปิดซ้อนอีกบาน
+        if self.dlg and self.dlg.isVisible():
+            self.dlg.raise_()
+            self.dlg.activateWindow()
+            return
         self.dlg = PathFilterTool(self.iface, self.iface.mainWindow())
         self.dlg.show()
+        self.dlg.check_update_on_open()
